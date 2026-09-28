@@ -1,12 +1,28 @@
-# Python-generated files
-__pycache__/
-*.py[oc]
-build/
-dist/
-wheels/
-*.egg-info
+# Generated experiment artifacts
+artifacts/**/*.npz
+artifacts/**/*.png
 
-# Virtual environments
-.venv
+# MCMC outputs / checkpoints
+outputs/
+results/
+checkpoints/
+**/draws-*.npz
+**/checkpoint.npz
+**/session-*.json
+
+# Python / JAX
+__pycache__/
+*.py[cod]
+*.egg-info
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.jax_cache/
+
+# Local environments
+.venv/
+venv/
+
+# OS / editor
 .DS_Store
 toy model/
