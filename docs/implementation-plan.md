@@ -1,6 +1,6 @@
 # Bayesian calibration implementation plan
 
-Status: Stages 1–14a are complete. Stage 14a uses the user-supplied synthetic data with 4-unit slope matching, seed-1024 N(0,1²) field noise before matching/projection, and unspecified units. The selected offset and full slope-error diagnostic are recorded; local OLS accepts irregular, repeated, and unsorted per-curve depths and scans a regular offset grid. Stage 14b execution preparation is implemented for five methods × four chains, with unbounded sites and six production hours per chain. The pre-benchmark hot-path simplification and revised zero-covariance warmup policy are implemented and validated; Unity locked-environment setup, artifact verification, and the five-method 20-sweep execution check are complete. All five checks exited successfully, with warmup tuning concerns recorded below; the subsequent reduced-scale 100-sweep checks finished with five successes and two collapsed-NUTS numerical failures; full production submission remains explicitly deferred. MH startup variance 1e-6 is implemented. The whitening implementation passed 54 focused tests but is now deferred by the user; replacement eta-space diagonal/Kronecker/dense NUTS is implemented and validated (49 focused tests), using the approved partial-trace estimator and Gamma notation. The subsequent direct factor-moment accumulator and its checkpoint/integration regressions pass 35 tests. The plan consolidates D01–D10, R01–R04, U01–U02, and the current model and sampler decisions.
+Status: Stages 1–14a are complete. Stage 14a uses the user-supplied synthetic data with 4-unit slope matching, seed-1024 N(0,1²) field noise before matching/projection, and unspecified units. The selected offset and full slope-error diagnostic are recorded; local OLS accepts irregular, repeated, and unsorted per-curve depths and scans a regular offset grid. Stage 14b execution preparation is implemented for five methods × four chains, with unbounded sites and six production hours per chain. The pre-benchmark hot-path simplification and revised zero-covariance warmup policy are implemented and validated; Unity locked-environment setup, artifact verification, and the five-method 20-sweep execution check are complete. All five checks exited successfully, with warmup tuning concerns recorded below; the subsequent reduced-scale 100-sweep checks finished with five successes and two collapsed-NUTS numerical failures; full production submission remains explicitly deferred. MH startup variance 1e-6 is implemented. The whitening implementation passed 54 focused tests but is now deferred by the user; replacement eta-space diagonal/Kronecker/dense NUTS is implemented and validated (49 focused tests), using the approved partial-trace estimator and Gamma notation. The subsequent direct factor-moment accumulator and its checkpoint/integration regressions pass 35 tests. The authorized 21-way 200-sweep Unity check is finished: MH/MALA/MMALA and all nine uncollapsed-NUTS combinations completed, while all nine collapsed-NUTS combinations failed before the first mass update; no production was submitted. The plan consolidates D01–D10, R01–R04, U01–U02, and the current model and sampler decisions.
 
 This is the single living plan. Keep decisions, milestone status, next task, and validation evidence here. Implement only the requested task and preserve unrelated user edits.
 
@@ -724,7 +724,7 @@ bash scripts/print_unity_commands.sh artifacts/stage14b/prepared.npz artifacts/c
 
 No connection or submission is performed by this command. Review the execution-check results before using the printed production command. Identical output paths automatically resume committed work. For allocation cost/memory after future execution, retain `sacct -j JOB_ID --units=K --format=JobID,State,ElapsedRaw,AllocCPUS,TotalCPU,MaxRSS` including job-step records, and sum allocation time over attempts; do not double-count job and step allocation rows.
 
-**Next task:** assess full-data warmup behavior with the implemented eta-space diagonal/Kronecker/full-dense NUTS options before production, using newly prepared artifacts. Kronecker choice 1 is implemented as `M^{-1} = Gamma_site ⊗ Gamma_param`, both estimated from eta warmup moments. MH initial variance remains 1e-6. Production remains deferred.
+**Next task:** investigate the collapsed-NUTS conditional-GP/invalid-state failures before its first mass update, persistent uncollapsed-NUTS tree caps after mass learning, and MALA’s unmoved site. Further diagnostics, tuning changes, and production require a subsequent instruction; no additional runs are pending. Kronecker choice 1 is implemented as `M^{-1} = Gamma_site ⊗ Gamma_param`, both estimated from eta warmup moments. MH initial variance remains 1e-6. Production remains deferred.
 
 References for the proposed diagnostics: [Stan diagnostic guidance](https://mc-stan.org/learn-stan/diagnostics-warnings.html) and [Vehtari et al., rank normalization, folding, and localization](https://arxiv.org/abs/1903.08008).
 
@@ -919,3 +919,130 @@ Validation completed (float64, local locked environment):
 - The added `test_online_factor_scatter_matches_centered_batch_at_every_step` passed in 0.692 s: JIT updates match centered batch scatter after every sample, including repeated states and nonzero means; no full scatter array exists; the final metric matches the old regularized dense-partial-trace reference and both scatters reset at the window boundary.
 - `PYTHONPATH=tests .venv/bin/python -m unittest test_nuts test_collapsed_nuts test_comparison test_mcmc`: 28 regression tests passed in 102.840 s.
 - Total: 35 tests passed, no failures. Source compilation and `git diff --check` passed. No full-suite rerun or full-data/HPC sampling was performed. The only remaining dense allocation in this adaptation representation is the selected inverse mass supplied to BlackJAX; dense NUTS kernel costs and real-data mixing performance remain outside this change.
+
+### 21-way 200-sweep execution checks (2026-09-28; finished: 12 completed, 9 failed)
+
+The user requests MH, MALA, MMALA and both NUTS targets with each diagonal/Kronecker/dense mass: nine chain-0 runs, 200 sweeps each, MH initial variance 1e-6. Production remains deferred. Two execution settings are being clarified: common initial NUTS step (current default 1 versus previously tested 0.1/0.01), and whether 200 means the prefix of the existing 1,000-step schedule or a complete 200-step warmup. No dependent sampling jobs will be submitted until these choices are resolved. MALA retains its separate identity preconditioner; MALA/MMALA epsilons remain 0.1.
+
+The locked environment passes offline sync. The old archive's hashes differ for adaptation.py, comparison.py, mcmc.py, run.py, and samplers/nuts.py, as expected after the user's mass-structure changes. Model/GP code and the comparison build_target/preparation calculations are unchanged. A fresh artifact will explicitly import the frozen library fit and all 34 numerical data/initial-state arrays with bitwise checks and source provenance, validate the target and initial states under current code, and carry current implementation hashes. Old artifacts/checkpoints will remain untouched; no old checkpoint or tuning will resume. Evidence belongs under `results/unity-mass-200-20260928/`.
+
+Resolved by the user: compare all three initial NUTS steps (1.0, 0.1, 0.01) for each of the three mass structures and both NUTS targets, and retain the 1,000-step schedule while stopping after 200 sweeps. Total is 21 chain-0 checks (MH/MALA/MMALA once each plus 18 NUTS combinations). Model, initial states, and per-method keys remain shared across tuning variants. No production.
+
+Compute-node validation passed: job `11193150` ran all seven `test_nuts_mass` cases successfully (124.895 s test time; 131.75 s process time). Preparation job `11193153` revalidated imported frozen inputs under the current implementation, all four states and 21 method/structure/step factories (33.97 s process time). All 34 arrays in each of nine new archives remain bitwise identical to the old archive; source hashes and migration provenance are recorded. Submitted arrays `11193154`–`11193162`, one per mass/step combination: diagonal step 1 includes tasks 0/4/8/12/16; all other arrays include 12/16 only. Explicit check limit 200, 1,000-step schedule, 4 CPUs/16 GiB, 45-minute limit, Cascade Lake partition/account as before. No production.
+
+Interim results: MH completed 200 sweeps, with accepted-site proportions 41.4% for sweeps 1–100 and 19.333% for 101–200; every site moved in each half. Dense collapsed NUTS at initial step 0.1 failed during sweeps 21–30 with the aggregate invalid-model-state check; 20 sweeps are committed. This predates the first mass update, so it cannot establish an effect of the learned dense mass. Other tasks continue; failures are retained without numerical repair or resubmission.
+
+Interim NUTS results: all collapsed-NUTS runs with initial steps 1.0 and 0.1 failed before mass learning: step 1.0 retained 40 sweeps and failed the conditional-GP covariance audit, step 0.1 retained 20 sweeps and failed the invalid-Gibbs-state check. The first successfully observed learned-mass transition was dense uncollapsed NUTS (initial step 0.1) at sweep 101; its 101–110 chunk had zero divergences but 10/10 tree caps. Continue the remaining checks before drawing any structure comparison.
+
+All nine collapsed-NUTS tasks have now failed before the first learned mass is used: initial step 1.0 committed 40 sweeps, 0.1 committed 20, and 0.01 committed 70, for each mass structure. Steps 1.0 and 0.01 failed conditional-GP geometry audits; 0.1 failed the aggregate invalid-state predicate. Therefore no learned collapsed-NUTS mass comparison is available. All nine uncollapsed runs validated use of nonidentity mass at sweep 101; their 101–110 chunks each had zero divergences and 10 tree caps. MH/MALA/MMALA have completed 200; uncollapsed NUTS remains running.
+
+Final 200-sweep results: all 21 sampling tasks terminated. MH/MALA/MMALA and all nine uncollapsed-NUTS combinations completed exactly 200 warmup sweeps (exit 0). All nine collapsed-NUTS combinations failed (exit 1) before the first mass update. Every run used the same original model data, fit and chain-0 initial state; per-method keys were reused across tuning variants, so these are paired tuning checks, not independent replicate chains. No sampling retries, new jitter, statistical-model changes, or production jobs were introduced.
+
+| Method | Mass | Initial NUTS step | Committed sweeps | Slurm elapsed (s) | Committed sweep driver (s) | Peak RSS (MiB) | Outcome |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| mh | — | — | 200 | 49 | 26.540 | 560.9 | COMPLETED |
+| mala | — | — | 200 | 243 | 221.177 | 676.2 | COMPLETED |
+| mmala | — | — | 200 | 961 | 763.056 | 931.3 | COMPLETED |
+| nuts | diagonal | 1 | 200 | 1217 | 1196.196 | 699.9 | COMPLETED |
+| collapsed_nuts | diagonal | 1 | 40 | 390 | 284.256 | 699.1 | FAILED |
+| nuts | diagonal | 0.1 | 200 | 1232 | 1206.458 | 683.1 | COMPLETED |
+| collapsed_nuts | diagonal | 0.1 | 20 | 233 | 149.815 | 670.4 | FAILED |
+| nuts | diagonal | 0.01 | 200 | 1255 | 1229.232 | 699.6 | COMPLETED |
+| collapsed_nuts | diagonal | 0.01 | 70 | 648 | 540.185 | 705.9 | FAILED |
+| nuts | kronecker | 1 | 200 | 1251 | 1224.412 | 742.5 | COMPLETED |
+| collapsed_nuts | kronecker | 1 | 40 | 405 | 296.423 | 718.0 | FAILED |
+| nuts | kronecker | 0.1 | 200 | 1222 | 1194.087 | 738.5 | COMPLETED |
+| collapsed_nuts | kronecker | 0.1 | 20 | 223 | 142.947 | 705.3 | FAILED |
+| nuts | kronecker | 0.01 | 200 | 1242 | 1215.208 | 735.6 | COMPLETED |
+| collapsed_nuts | kronecker | 0.01 | 70 | 621 | 512.023 | 684.8 | FAILED |
+| nuts | dense | 1 | 200 | 1209 | 1182.070 | 738.9 | COMPLETED |
+| collapsed_nuts | dense | 1 | 40 | 288 | 204.181 | 897.7 | FAILED |
+| nuts | dense | 0.1 | 200 | 996 | 968.881 | 941.3 | COMPLETED |
+| collapsed_nuts | dense | 0.1 | 20 | 164 | 102.744 | 902.7 | FAILED |
+| nuts | dense | 0.01 | 200 | 1191 | 1167.884 | 746.5 | COMPLETED |
+| collapsed_nuts | dense | 0.01 | 70 | 480 | 394.235 | 733.1 | FAILED |
+
+Slurm elapsed includes startup, initialization, compilation, checkpoint I/O and uncommitted failed work; committed sweep time excludes failed chunks. MaxRSS comes from the sampling job step. Each task had four CPUs and 16 GiB on Cascade Lake nodes u086/u087/u088/u117/u118; different nodes and concurrent workloads limit direct timing comparisons. Allocation cost was 62,080 core-seconds (17.2444 core-hours) for all sampling attempts, including failures, plus 664 core-seconds for tests/preparation: 62,744 core-seconds (17.4289 core-hours) total. Scheduler wait is separately recoverable from Submit/Start in `accounting.psv`; dense-step-0.01 tasks started later. No job-step allocation rows were double-counted.
+
+MH variance remains 1e-6; MALA's initial preconditioner remains identity. Accepted-site proportions over 200 sweeps: MH 3,644/12,000 = 30.367%; MALA 6,865/12,000 = 57.208%; MMALA 6,903/12,000 = 57.525%. MH's halves were 41.4% and 19.333%, MALA's 53.75% and 60.667%, MMALA's 57.567% and 57.483%. MH/MMALA had no unmoved sites in either half; MALA had one unmoved site, also unmoved across all 200. These are movement/acceptance checks, not convergence or ESS evidence.
+
+| Uncollapsed NUTS mass | Initial step | Divergences / 200 | Tree caps / 200 | Divergences / last 100 | Tree caps / last 100 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| diagonal | 1 | 9 | 192 | 1 | 99 |
+| diagonal | 0.1 | 12 | 189 | 1 | 99 |
+| diagonal | 0.01 | 9 | 193 | 2 | 99 |
+| kronecker | 1 | 9 | 192 | 1 | 99 |
+| kronecker | 0.1 | 12 | 189 | 1 | 99 |
+| kronecker | 0.01 | 8 | 193 | 1 | 99 |
+| dense | 1 | 11 | 190 | 3 | 97 |
+| dense | 0.1 | 13 | 188 | 2 | 98 |
+| dense | 0.01 | 8 | 193 | 1 | 99 |
+
+Every successful uncollapsed NUTS run first used learned nonidentity mass at sweep 101. Mass structures were checked against checkpoint metadata (`nuts.mass_matrix`, eta-v1 coordinates); final inverse masses have positive finite eigenvalues. The second window closes at sweep 150; adaptation is still in progress at 200 and no production tuning is frozen. All structures retain 97–99% tree-cap frequency in the latter half, so this short check does not establish a successful mixing improvement or a preferred NUTS configuration.
+
+Collapsed-NUTS outcomes are identical by mass label at these committed boundaries: initial step 1.0 saved 40 sweeps, then failed the field-site audit of the 41–50 chunk with `Unjittered C_f_given_s is singular or numerically singular`; step 0.1 saved 20, then failed within 21–30 with `Gibbs sweep produced invalid model state`; step 0.01 saved 70, then failed the audit of 71–80 with the same conditional-GP singularity message. The state predicate does not identify the precise bad component or sweep. Only committed valid chunks are summarized: respective divergence/tree-cap counts are 10/30 (40 draws), 5/15 (20 draws), and 12/58 (70 draws). No run used learned mass before failing, so no collapsed-target learned-mass comparison can be claimed.
+
+Validation: seven modified-mass tests passed on Unity; fresh preparation preserved all 34 numerical arrays bitwise and validated all four starts and 21 factories. Final audit verified all nine archive hashes, every committed draw-chunk checksum, contiguous sweep numbers, finite stored states/full joint densities, check limit 200 with the unchanged 1,000-sweep schedule, warmup checkpoint phase, expected mass/eta metadata, successful exits/empty stderr for the twelve completions, failed exits/error logs for the nine failures, and zero production clocks. Current source hashes still match the archived run implementation, so no code changed during execution. Final mass eigenvalues are positive for all saved NUTS boundaries. Shell syntax and `git diff --check` passed. The completed-run audit does not turn failed runs into successful ones.
+
+Evidence: `results/unity-mass-200-20260928/summary.json` (all 21 records, per-half/last-20 diagnostics, time/memory, final mass shape/eigenvalues and errors), `accounting.psv`, `manifest.json`, `submissions.json`, `validation.out`, and all per-variant draw/checkpoint/log files. `prepare.py`, `summarize.py`, and `progress.py` preserve the execution/audit workflow. The user queue is empty. Full production remains unsubmitted.
+
+### Configurable blocked NUTS (2026-09-28; awaiting blocking decisions)
+
+The user requested a configurable NUTS block size, giving `12 × 5` as an example. Clarification is pending whether 12 counts sites (60 sites → five blocks, 36 theta coordinates per block because d=3) or scalar theta coordinates. Proposed implementation, awaiting explicit confirmation: contiguous site-major blocks in fixed sequential order, covering every site once per outer sweep; both collapsed and uncollapsed targets; separate step size and mass/window adaptation for every block; diagonal/dense/Kronecker choices apply within each block (Gamma_site is block-site × block-site and Gamma_param remains d × d). The conditional target must keep all outside-block eta at their latest values and recompute density/gradient at each block entry; it must not replace the full spatial/GP target with independent site models. Preserve the existing outer Gibbs schedule and immediate c_f refresh after the entire theta block sweep. No numerical/model changes or new cluster runs have been performed for this task.
+
+Inspection shows the current NUTS kernel, chain tuning/adaptation, scalar diagnostics, chunk runner and checkpoint protocol all assume a single all-site trajectory. Implementation must update them together after the decisions: explicit block specification and PRNG splitting, per-block diagnostics/tuning, frozen adaptation, restart serialization and comparison configuration. Preserve the existing one-block behavior when block size is absent or covers all sites. Proposed handling of a non-dividing size is one smaller final block, without padding or dropping sites; validate a positive integer no larger than the site count. Acceptance work should cover direct sequential BlackJAX conditional references (including dependence on earlier blocks), both targets and bounds modes, all mass structures, a smaller final block, one-block equivalence, complete outer Gibbs ordering, and bitwise warmup/frozen/restart behavior. These validation details are implementation proposals, not evidence of completed work.
+
+
+### 2026-09-29 — Review of MH/MALA/MMALA production attempt 11193199
+
+The user requested inspection of `results/unity-production-20260929`. Contrary to the earlier production-deferred status above, this archive records an actual submitted attempt: three methods × four chains, 1,000 warmup sweeps, six production compute-hours per chain, chunks of ten. All twelve sessions failed; none completed the production budget. This review does not complete Stage 14b. No sampling, retries, tuning changes, or model changes were performed.
+
+| Method | Chain (zero-based) | Last committed sweep | Production draws | Production compute minutes | Production accepted-site % | Failure |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| MH | 0 | 15350 | 14350 | 24.237 | 3.611 | Conditional-GP singularity |
+| MH | 1 | 1600 | 600 | 0.936 | 3.644 | Conditional-GP singularity |
+| MH | 2 | 870 | 0 | 0 | — | Invalid Gibbs state |
+| MH | 3 | 5370 | 4370 | 8.575 | 3.995 | Invalid Gibbs state |
+| MALA | 0–3 | 990 each | 0 | 0 | — | Zero empirical covariance at warmup sweep 1000 |
+| MMALA | 0 | 6480 | 5480 | 297.837 | 57.169 | Conditional-GP singularity |
+| MMALA | 1 | 70 | 0 | 0 | — | Invalid Gibbs state |
+| MMALA | 2 | 2090 | 1090 | 63.921 | 57.459 | Conditional-GP singularity |
+| MMALA | 3 | 3390 | 2390 | 126.375 | 57.506 | Conditional-GP singularity |
+
+The open task-0 stderr is MH chain 0: `Unjittered C_f_given_s is singular or numerically singular`, raised in the end-of-chunk field-site audit for sweeps 15351–15360. Other failures occur in the next ten-sweep chunk after the saved boundary; the aggregate invalid-state check does not identify the exact sweep or invalid component. MALA's warmup failure diagnostics record 1000 attempted sweeps, but the rejected final chunk leaves only 990 committed. Its never-moved/zero-covariance sites (zero-based) are chain 0: [27]; chain 1: [29,30,31]; chain 2: [27,28,29,31,33]; chain 3: [27,28,30].
+
+Acceptance rates summarize retained sampling sweeps, not convergence. MALA has no production draws; MH/MMALA each have only three prematurely terminated production chains with unequal lengths. No successful four-chain convergence or ESS/sec comparison is established. The six-hour budget counts production sweep computation, excluding warmup/compilation/I/O; MMALA chain 0 used 297.837 production minutes despite 435.122 total wall minutes. Recorded I/O is substantial in some sessions, so wall-time comparisons require care.
+
+Validation: `audit_results.py` verified all 3,918 committed chunk SHA256 checksums, contiguous iteration ranges and phase labels, finite stored model states/full joint densities, checkpoint/session iteration agreement, and exact agreement of recomputed acceptance/movement counts with sessions. No uncommitted draw files remain. This is artifact validation, not a fresh numerical covariance audit of every draw. All twelve stderr files report Python errors and srun exit code 1. Slurm accounting could not be queried because the scheduler/database connection was unavailable; no scheduler-level elapsed/RSS claim is made. Reproducible audit and full chain records are saved as `results/unity-production-20260929/audit_results.py` and `audit-summary.json`.
+
+Next task: localize the conditional-GP degeneracy/invalid state and diagnose MALA's immobile sites before another production attempt. Numerical/model remedies remain undecided and require explicit approval where they change the specified model or numerical policy. Existing unrelated code and plan edits were preserved.
+
+### 2026-09-29 — Blocked NUTS 300-sweep checks submitted; no monitoring requested
+
+The user explicitly requested submission with block size 12, varied initial step sizes, both collapsed/uncollapsed targets, and termination of monitoring immediately after submission. Submitted six chain-0 checks using the existing implementation's site-based block semantics: 60 sites split into five contiguous 12-site blocks, 36 eta coordinates per block. Use initial steps 1.0/0.1/0.01 from the previous comparison, current default diagonal mass, and the established 1,000-sweep warmup schedule with a 300-sweep check limit. Each outer sweep visits all five blocks. This request uses existing blocked behavior; no sampler/model implementation was modified. No production is requested.
+
+Submission receipts: validation/preparation job `11195750`; step 1 array `11195751`; step 0.1 array `11195752`; step 0.01 array `11195753`. Each array has tasks 12 (uncollapsed chain 0) and 16 (collapsed chain 0), with `afterok:11195750` and `--kill-on-invalid-dep=yes`. Validation runs `test_nuts_blocks` then imports frozen numerical data/fit/starts from the previous production prepared archive, verifies bitwise preservation, validates all six factories, and records new implementation hashes. Validation results are pending, not claimed as passed. All jobs use stat-cascade/stat-users, Cascade constraint, four CPUs and 16 GiB; validation limit 30 minutes and each sampling limit three hours to accommodate five block transitions per sweep.
+
+Local preparation validation: Python compilation of preparation/submission scripts and shell syntax check passed. The initial sandboxed scheduler call failed before returning any job ID; the authorized network-enabled submission returned all four IDs successfully. Exact commands/receipts are in `results/unity-blocked-300-20260929/submissions.json`; validation logs and per-step sampling logs remain under that directory. Original experiments/configuration and prior artifacts are unchanged. No queue/progress/result polling was performed after successful submission, as requested. Next task is user-initiated result review; stop work now without monitoring.
+
+
+### 2026-09-29 — Last committed production-state GP geometry
+The user requested minimum eigenvalues of C_f_given_s and pairwise theta distances immediately before the MH/MALA/MMALA failures. The available states are the last committed checkpoints; failed ten-sweep chunks were not serialized. No transitions were replayed, and these results do not claim to reconstruct the actual failing state. All coordinates are unbounded, so eta equals standardized theta. Compute the unjittered site-level conditional correlation C_ff - C_fs solve(C_ss,C_fs.T), symmetrized exactly as the host audit; also independently evaluate the sampler Cholesky-solve expression. No coefficient-variance Kronecker factor is included in this C_f_given_s.
+| Method | Chain | Saved sweep | Minimum eigenvalue (host audit) | Minimum / audit threshold | Minimum standardized field distance | Closest sites (zero-based) | Minimum kernel-metric field distance |
+| --- | ---: | ---: | ---: | ---: | ---: | --- | ---: |
+| mh | 0 | 15350 | 2.066444e-15 | 1.394 | 0.101755 | [17, 45] | 0.0238401 |
+| mh | 1 | 1600 | 2.800290e-14 | 172.153 | 0.123619 | [55, 59] | 0.0246699 |
+| mh | 2 | 870 | 1.225807e-14 | 8.413 | 0.0612664 | [0, 1] | 0.00981567 |
+| mh | 3 | 5370 | 9.637163e-16 | 2.525 | 0.0241012 | [18, 38] | 0.00400804 |
+| mala | 0 | 990 | 2.451038e-14 | 15.926 | 0.0934976 | [17, 45] | 0.0194088 |
+| mala | 1 | 990 | 7.384396e-14 | 464.639 | 0.106581 | [58, 59] | 0.0191091 |
+| mala | 2 | 990 | 1.581025e-14 | 10.629 | 0.0854521 | [43, 44] | 0.0128672 |
+| mala | 3 | 990 | 7.267688e-15 | 19.467 | 0.157659 | [57, 58] | 0.0300738 |
+| mmala | 0 | 6480 | 2.901246e-15 | 1.896 | 0.0684695 | [1, 21] | 0.0130871 |
+| mmala | 1 | 70 | 4.550992e-14 | 283.431 | 0.122575 | [56, 59] | 0.0206932 |
+| mmala | 2 | 2090 | 3.135389e-14 | 17.994 | 0.102611 | [23, 24] | 0.0165547 |
+| mmala | 3 | 3390 | 1.067508e-15 | 2.865 | 0.137506 | [18, 38] | 0.0222391 |
+
+All twelve saved states pass the relative host threshold 32*eps64*lambda_max in this recomputation, consistent with their committed status. MH chain 0, MH chain 3, MMALA chain 0, and MMALA chain 3 have minimum/threshold ratios 1.39, 2.52, 1.90, and 2.86 respectively. The corresponding matrices are already very ill-conditioned. No exact field-field or field-library theta coincidences are present. Kernel-scaled nearest field distances span approximately 0.00401–0.0301; nearest field-library distances span 0.0379–0.0986. Thus exact pair collisions do not explain these stored states; near-dependence of the smooth conditioned GP can occur without exact duplicates. This is a geometric observation, not proof of the source of each failed transition or of MALA's zero-covariance adaptation failure.
+
+Validation/evidence: `inspect_geometry.py` completed for all twelve checkpoints with float64 JAX kernel values, NumPy host eigensolves and a second JAX Cholesky-solve covariance calculation. Both covariance expressions have positive computed minima for these checkpoints; their small differences at approximately machine precision materially affect minima near 1e-15, so last digits are not robust across numerical implementations. `checkpoint-geometry.json` records checkpoint SHA256 hashes, both minima, lambda_max, exact thresholds, covariance differences, distance quantiles, nearest pairs and fixed GP length scales. `checkpoint-geometry.npz` stores all twelve theta arrays, both conditional matrices/eigenspectra, and complete standardized/kernel-scaled field-field and field-library distance matrices. Distances exclude the field self-diagonal. Physical-coordinate Euclidean distances are not pooled because parameter coordinates have different scales/units. No model/sampler changes or cluster sampling jobs were made. Next task, if requested, is explicit replay/instrumentation of failed chunks to localize the first invalid state; that has not been performed here.

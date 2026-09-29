@@ -33,7 +33,7 @@ printf '%q ' "${common[@]}" --time="$CHECK_WALLTIME" --array=0,4,8,12,16 \
 printf '\n'
 echo '# After reviewing checks and resource/tuning feasibility: 20 independent jobs.'
 printf '%q ' "${common[@]}" --time="$PRODUCTION_WALLTIME" \
-    "--array=0-19%${MAX_PARALLEL:-20}" "$repo/scripts/unity_comparison.sh" \
+    --array=0-11 "$repo/scripts/unity_comparison.sh" \
     "$prepared" "$output" production
 printf '\n'
 echo '# Nothing was submitted. Reuse the same command/output directory to resume.'

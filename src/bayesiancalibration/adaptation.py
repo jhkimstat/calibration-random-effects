@@ -166,7 +166,7 @@ class NUTSAdaptationState:
     completed: int
     initial_step_size: float
     target_accept: float
-    state: StagedAdaptationState
+    state: StagedAdaptationState | tuple[StagedAdaptationState, ...]
 
 
 def validate_nuts_adaptation(adaptation: NUTSAdaptationState, size: int,

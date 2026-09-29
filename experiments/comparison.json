@@ -12,6 +12,7 @@
   "mala_target_accept": 0.574,
   "mmala_target_accept": 0.574,
   "nuts_mass_structure": "diagonal",
+  "nuts_block_size": null,
   "nuts_initial_step_size": 1.0,
   "nuts_target_accept": 0.8,
   "max_num_doublings": 10,

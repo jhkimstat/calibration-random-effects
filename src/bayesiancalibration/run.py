@@ -27,6 +27,7 @@ from bayesiancalibration.adaptation import (
     KroneckerWelfordState,
     MMALAAdaptationState,
 )
+from bayesiancalibration.samplers.nuts import nuts_blocks
 from bayesiancalibration.mcmc import (
     MALAChain,
     RandomWalkChain,
@@ -140,12 +141,18 @@ def save_checkpoint(
     nuts_metadata = None
     if is_nuts:
         arrays["sampler.step_size"] = np.asarray(chain.step_size, dtype=np.float64)
-        arrays["sampler.inverse_mass_matrix"] = np.asarray(chain.inverse_mass_matrix)
+        if chain.block_size is None:
+            arrays["sampler.inverse_mass_matrix"] = np.asarray(chain.inverse_mass_matrix)
+        else:
+            arrays.update({f"sampler.inverse_mass_matrix.{i}": np.asarray(mass)
+                           for i, mass in enumerate(chain.inverse_mass_matrix)})
         nuts_metadata = {
             "max_num_doublings": chain.max_num_doublings,
             "divergence_threshold": chain.divergence_threshold,
             "integrator": "velocity_verlet", "mass_matrix": chain.mass_structure,
-            "coordinates": "eta-v1",
+            "coordinates": "eta-v1", "block_size": chain.block_size,
+            "block_order": "contiguous-sites-v1",
+            "theta_key_protocol": "split-blocks-v1" if chain.block_size is not None else "unsplit-v1",
         }
     elif not is_mmala:
         arrays["sampler.V_prop"] = np.asarray(chain.V_prop)
@@ -173,15 +180,18 @@ def save_checkpoint(
     adaptation_metadata = None
     if is_nuts and chain.adaptation is not None:
         adaptation = chain.adaptation
-        window = adaptation.state
-        for prefix, state in (("ss", window.ss_state), ("wc", window.imm_state.wc_state)):
-            arrays.update({f"window.{prefix}.{name}": np.asarray(value)
-                           for name, value in zip(state._fields, state)})
-        arrays["window.step_size"] = np.asarray(window.step_size)
-        arrays["window.inverse_mass_matrix"] = np.asarray(window.inverse_mass_matrix)
+        windows = adaptation.state if chain.block_size is not None else (adaptation.state,)
+        for i, window in enumerate(windows):
+            root = f"window.{i}" if chain.block_size is not None else "window"
+            for prefix, state in (("ss", window.ss_state), ("wc", window.imm_state.wc_state)):
+                arrays.update({f"{root}.{prefix}.{name}": np.asarray(value)
+                               for name, value in zip(state._fields, state)})
+            arrays[f"{root}.step_size"] = np.asarray(window.step_size)
+            arrays[f"{root}.inverse_mass_matrix"] = np.asarray(window.inverse_mass_matrix)
         arrays["window.schedule"] = np.asarray(build_schedule(adaptation.num_warmup))
         adaptation_metadata = {
-            "protocol": "eta-staged-factor-moments-v2",
+            "protocol": ("eta-blocked-factor-moments-v1" if chain.block_size is not None
+                         else "eta-staged-factor-moments-v2"),
             "num_warmup": adaptation.num_warmup, "completed": adaptation.completed,
             "initial_step_size": adaptation.initial_step_size,
             "target_accept": adaptation.target_accept,
@@ -322,7 +332,13 @@ def load_checkpoint(
         model_arrays = [arrays[f"state.{name}"] for name in CalibrationState._fields]
         is_nuts = metadata["sampler"] in ("uncollapsed_nuts", "collapsed_nuts")
         is_mmala = metadata["sampler"] == "collapsed_mmala"
-        tuning_names = ("step_size", "inverse_mass_matrix") if is_nuts else (
+        blocked = is_nuts and metadata["nuts"].get("block_size") is not None
+        if is_nuts:
+            blocks = nuts_blocks(model_arrays[0].shape[0], metadata["nuts"].get("block_size"))
+            if blocked and len(blocks) == 1:
+                raise ValueError("Single-block checkpoints must use the all-site representation")
+        tuning_names = (("step_size", *(f"inverse_mass_matrix.{i}" for i in range(len(blocks))))
+                        if blocked else ("step_size", "inverse_mass_matrix")) if is_nuts else (
             ("epsilon", "epsilon_G") if is_mmala else ("V_prop",)
         )
         expected_tuning = {f"sampler.{name}" for name in tuning_names}
@@ -353,6 +369,8 @@ def load_checkpoint(
             if (not isinstance(config, dict) or config.get("integrator") != "velocity_verlet"
                 or config.get("mass_matrix") not in ("diagonal", "dense", "kronecker")
                 or config.get("coordinates") != "eta-v1"
+                or config.get("block_order") != "contiguous-sites-v1"
+                or config.get("theta_key_protocol") != ("split-blocks-v1" if blocked else "unsplit-v1")
                 or metadata["step_size_adaptation"] is not None
                 or any(name.startswith(("step_size.", "adaptation.")) for name in arrays)
                 or "sampler.V_prop" in arrays or "sampler.epsilon" in arrays):
@@ -360,41 +378,46 @@ def load_checkpoint(
             adaptation = None
             am = metadata["adaptation"]
             if am is not None:
-                if (am.get("protocol") != "eta-staged-factor-moments-v2"
+                protocol = "eta-blocked-factor-moments-v1" if blocked else "eta-staged-factor-moments-v2"
+                if (am.get("protocol") != protocol
                     or am.get("buffers") != [75, 25, 50]
                     or am.get("imm_shrinkage_to_previous") != 0.0
                     or am.get("dual_averaging") != {"t0": 10, "gamma": 0.05, "kappa": 0.75}):
                     raise ValueError("Unsupported NUTS window configuration")
                 if not np.array_equal(arrays["window.schedule"], build_schedule(am["num_warmup"])):
                     raise ValueError("NUTS checkpoint window schedule does not match")
-                ss = DualAveragingAdaptationState(*(
-                    jnp.asarray(arrays[f"window.ss.{name}"])
-                    for name in DualAveragingAdaptationState._fields
-                ))
-                moments_type = (KroneckerWelfordState if config["mass_matrix"] == "kronecker"
-                                else WelfordAlgorithmState)
-                wc = moments_type(*(
-                    jnp.asarray(arrays[f"window.wc.{name}"])
-                    for name in moments_type._fields
-                ))
-                mass = jnp.asarray(arrays["window.inverse_mass_matrix"])
-                window = StagedAdaptationState(
-                    ss, MassMatrixAdaptationState(mass, wc),
-                    jnp.asarray(arrays["window.step_size"]), mass,
-                )
+                windows, expected_window = [], {"window.schedule"}
+                for i in range(len(blocks)):
+                    root = f"window.{i}" if blocked else "window"
+                    moments_type = (KroneckerWelfordState if config["mass_matrix"] == "kronecker"
+                                    else WelfordAlgorithmState)
+                    for prefix, typ in (("ss", DualAveragingAdaptationState), ("wc", moments_type)):
+                        expected_window.update(f"{root}.{prefix}.{name}" for name in typ._fields)
+                    expected_window.update((f"{root}.step_size", f"{root}.inverse_mass_matrix"))
+                    ss = DualAveragingAdaptationState(*(
+                        jnp.asarray(arrays[f"{root}.ss.{name}"])
+                        for name in DualAveragingAdaptationState._fields))
+                    wc = moments_type(*(jnp.asarray(arrays[f"{root}.wc.{name}"])
+                                        for name in moments_type._fields))
+                    mass = jnp.asarray(arrays[f"{root}.inverse_mass_matrix"])
+                    windows.append(StagedAdaptationState(
+                        ss, MassMatrixAdaptationState(mass, wc),
+                        jnp.asarray(arrays[f"{root}.step_size"]), mass))
+                if {k for k in arrays if k.startswith("window.")} != expected_window:
+                    raise ValueError("NUTS window payload does not match block layout")
                 adaptation = NUTSAdaptationState(
-                    am["num_warmup"], am["completed"], am["initial_step_size"],
-                    am["target_accept"], window,
-                )
+                    am["num_warmup"], am["completed"], am["initial_step_size"], am["target_accept"],
+                    tuple(windows) if blocked else windows[0])
             elif any(name.startswith("window.") for name in arrays):
                 raise ValueError("NUTS window payload requires its schedule")
-            if tuning[0].shape != ():
-                raise ValueError("NUTS step_size must be a float64 scalar")
+            if tuning[0].shape != ((len(blocks),) if blocked else ()):
+                raise ValueError("NUTS step_size shape does not match block layout")
             chain = NUTSChain(
-                state, key, float(tuning[0]), jnp.asarray(tuning[1]),
+                state, key, jnp.asarray(tuning[0]) if blocked else float(tuning[0]),
+                tuple(jnp.asarray(m) for m in tuning[1:]) if blocked else jnp.asarray(tuning[1]),
                 metadata["iteration"], metadata["phase"], adaptation,
                 config["max_num_doublings"], config["divergence_threshold"],
-                metadata["sampler"] == "collapsed_nuts", config["mass_matrix"],
+                metadata["sampler"] == "collapsed_nuts", config["mass_matrix"], config.get("block_size"),
             )
             return validate_nuts_chain(target, chain), metadata
         if any(name.startswith("window.") for name in arrays) or metadata["nuts"] is not None:

@@ -44,7 +44,7 @@ from bayesiancalibration.samplers.metropolis import (
 )
 from bayesiancalibration.state import CalibrationState
 from bayesiancalibration.samplers.nuts import (
-    NUTSSweepInfo, nuts_sweep,
+    NUTSSweepInfo, nuts_sweep, nuts_blocks,
 )
 from bayesiancalibration.samplers.mmala import (
     collapsed_mmala_sweep, validate_mmala_geometry,
@@ -661,8 +661,8 @@ class NUTSChain:
 
     model_state: CalibrationState
     key: Array
-    step_size: float
-    inverse_mass_matrix: Array
+    step_size: float | Array
+    inverse_mass_matrix: Array | tuple[Array, ...]
     iteration: int = 0
     phase: str = "sampling"
     adaptation: NUTSAdaptationState | None = None
@@ -670,13 +670,14 @@ class NUTSChain:
     divergence_threshold: float = 1000.0
     collapsed: bool = False
     mass_structure: str = "diagonal"
+    block_size: int | None = None
 
 
 def nuts_gibbs_sweep(
     key: Array, target: CalibrationTarget, state: CalibrationState,
     step_size: Array, inverse_mass_matrix: Array,
     *, max_num_doublings: int = 10, divergence_threshold: float = 1000,
-    collapsed: bool = False,
+    collapsed: bool = False, block_size: int | None = None,
 ) -> tuple[CalibrationState, Array, GibbsSweepInfo]:
     """Use the common outer schedule with matched all-site NUTS kernels.
 
@@ -691,7 +692,7 @@ def nuts_gibbs_sweep(
             theta_key, target, conditioned, step_size, inverse_mass_matrix,
             max_num_doublings=max_num_doublings,
             divergence_threshold=divergence_threshold,
-            collapsed=collapsed,
+            collapsed=collapsed, block_size=block_size,
         )
     return collapsed_gibbs_sweep(key, target, state, None, _theta_transition=transition)
 
@@ -711,43 +712,58 @@ def validate_nuts_chain(target: CalibrationTarget, chain: NUTSChain) -> NUTSChai
     if not isinstance(chain.collapsed, bool):
         raise ValueError("NUTS collapsed must be a boolean target choice")
     n, d = chain.model_state.eta.shape
+    blocks = nuts_blocks(n, chain.block_size)
+    blocked = len(blocks) > 1
     identity = jnp.tile(jnp.eye(d, dtype=jnp.float64), (n, 1, 1))
     checked = validate_random_walk_chain(target, RandomWalkChain(
         chain.model_state, chain.key, identity, chain.iteration
     ))
     for name in ("step_size", "divergence_threshold"):
         value = np.asarray(getattr(chain, name))
-        if (value.shape != () or value.dtype.kind not in "fiu"
-            or not np.isfinite(value) or value <= 0):
-            raise ValueError(f"NUTS {name} must be a finite positive scalar")
+        shape = (len(blocks),) if name == "step_size" and blocked else ()
+        if (value.shape != shape or value.dtype.kind not in "fiu"
+            or not np.all(np.isfinite(value)) or np.any(value <= 0)):
+            raise ValueError(f"NUTS {name} must have shape {shape} and be finite positive")
     if (isinstance(chain.max_num_doublings, bool)
         or not isinstance(chain.max_num_doublings, Integral)
         or chain.max_num_doublings < 1):
         raise ValueError("max_num_doublings must be a positive integer")
-    mass = np.asarray(chain.inverse_mass_matrix)
-    validate_nuts_mass(mass, n*d, chain.mass_structure, (n, d))
+    if blocked and (not isinstance(chain.inverse_mass_matrix, tuple)
+                    or len(chain.inverse_mass_matrix) != len(blocks)):
+        raise ValueError("Blocked NUTS requires one inverse mass array per block")
+    masses = chain.inverse_mass_matrix if blocked else (chain.inverse_mass_matrix,)
     if chain.phase not in ("warmup", "sampling"):
         raise ValueError("Invalid NUTS phase")
     adapt = chain.adaptation
     if adapt is None:
         if chain.phase != "sampling":
             raise ValueError("NUTS warmup requires a window schedule")
+        windows = (None,) * len(blocks)
     else:
-        validate_nuts_adaptation(adapt, n*d, chain.mass_structure, (n, d))
-        if chain.phase == "warmup":
-            if adapt.completed >= adapt.num_warmup or chain.iteration != adapt.completed:
-                raise ValueError("NUTS warmup phase/count mismatch")
-            expected_step, expected_mass = adapt.state.step_size, adapt.state.inverse_mass_matrix
-        else:
-            if adapt.completed != adapt.num_warmup or chain.iteration < adapt.completed:
-                raise ValueError("NUTS production requires completed window adaptation")
-            _, _, final = nuts_window_adapter(
-                    adapt.target_accept, chain.mass_structure, chain.model_state.eta.shape)
-            expected_step, expected_mass = final(adapt.state)
-        if float(chain.step_size) != float(expected_step) or not np.array_equal(
-            mass, expected_mass
-        ):
-            raise ValueError("NUTS tuning disagrees with its window phase/state")
+        if not isinstance(adapt, NUTSAdaptationState):
+            raise ValueError("NUTS requires standard window adaptation state")
+        if blocked and (not isinstance(adapt.state, tuple)
+                        or len(adapt.state) != len(blocks)):
+            raise ValueError("Blocked NUTS requires one window state per block")
+        windows = adapt.state if blocked else (adapt.state,)
+    steps = np.asarray(chain.step_size).reshape(-1)
+    for index, ((start, stop), mass, window) in enumerate(zip(blocks, masses, windows)):
+        shape = (stop-start, d)
+        validate_nuts_mass(mass, (stop-start)*d, chain.mass_structure, shape)
+        if adapt is not None:
+            validate_nuts_adaptation(replace(adapt, state=window),
+                                     (stop-start)*d, chain.mass_structure, shape)
+            if chain.phase == "warmup":
+                if adapt.completed >= adapt.num_warmup or chain.iteration != adapt.completed:
+                    raise ValueError("NUTS warmup phase/count mismatch")
+                expected_step, expected_mass = window.step_size, window.inverse_mass_matrix
+            else:
+                if adapt.completed != adapt.num_warmup or chain.iteration < adapt.completed:
+                    raise ValueError("NUTS production requires completed window adaptation")
+                _, _, final = nuts_window_adapter(adapt.target_accept, chain.mass_structure, shape)
+                expected_step, expected_mass = final(window)
+            if float(steps[index]) != float(expected_step) or not np.array_equal(mass, expected_mass):
+                raise ValueError("NUTS tuning disagrees with its window phase/state")
     s = checked.model_state
     def density(eta):
         if chain.collapsed:
@@ -764,8 +780,11 @@ def validate_nuts_chain(target: CalibrationTarget, chain: NUTSChain) -> NUTSChai
         adapt = replace(adapt, num_warmup=int(adapt.num_warmup), completed=int(adapt.completed),
                         initial_step_size=float(adapt.initial_step_size),
                         target_accept=float(adapt.target_accept))
-    return replace(chain, model_state=s, step_size=float(chain.step_size),
-                   inverse_mass_matrix=jnp.asarray(mass, dtype=jnp.float64), adaptation=adapt,
+    return replace(chain, model_state=s,
+                   step_size=jnp.asarray(steps) if blocked else float(steps[0]),
+                   inverse_mass_matrix=(tuple(jnp.asarray(m, dtype=jnp.float64) for m in masses)
+                                        if blocked else jnp.asarray(masses[0], dtype=jnp.float64)),
+                   adaptation=adapt, block_size=int(chain.block_size) if blocked else None,
                    iteration=checked.iteration, max_num_doublings=int(chain.max_num_doublings),
                    divergence_threshold=float(chain.divergence_threshold))
 
@@ -775,13 +794,14 @@ def initialize_nuts_chain(
     *, step_size: float, inverse_mass_matrix: Array,
     max_num_doublings: int = 10, divergence_threshold: float = 1000,
     collapsed: bool = False, mass_structure: str = "diagonal",
+    block_size: int | None = None,
 ) -> NUTSChain:
     """Initialize checked fixed NUTS tuning; select collapse explicitly."""
 
     return validate_nuts_chain(target, NUTSChain(
         state, key, step_size, inverse_mass_matrix,
         max_num_doublings=max_num_doublings, divergence_threshold=divergence_threshold,
-        collapsed=collapsed, mass_structure=mass_structure,
+        collapsed=collapsed, mass_structure=mass_structure, block_size=block_size,
     ))
 
 
@@ -791,6 +811,7 @@ def initialize_nuts_warmup(
     target_accept: float = 0.8, max_num_doublings: int = 10,
     divergence_threshold: float = 1000,
     collapsed: bool = False, mass_structure: str = "diagonal",
+    block_size: int | None = None,
 ) -> NUTSChain:
     """Resolve the selected eta-space window-adaptation defaults explicitly.
 
@@ -800,16 +821,24 @@ def initialize_nuts_warmup(
     feedback from the NUTS trajectory and current conditional each time.
     """
 
-    init, _, _ = nuts_window_adapter(target_accept, mass_structure, state.eta.shape)
+    blocks = nuts_blocks(state.eta.shape[0], block_size)
+    windows = []
+    for start, stop in blocks:
+        init, _, _ = nuts_window_adapter(target_accept, mass_structure,
+                                         (stop-start, state.eta.shape[1]))
+        windows.append(jax.tree.map(jnp.asarray, init(
+            state.eta[start:stop].reshape(-1), initial_step_size)))
+    blocked = len(blocks) > 1
     adaptation = NUTSAdaptationState(
         num_warmup, 0, initial_step_size, target_accept,
-        jax.tree.map(jnp.asarray, init(state.eta.reshape(-1), initial_step_size)),
+        tuple(windows) if blocked else windows[0],
     )
     chain = NUTSChain(
-        state, key, initial_step_size, adaptation.state.inverse_mass_matrix,
+        state, key, jnp.full((len(blocks),), initial_step_size) if blocked else initial_step_size,
+        tuple(w.inverse_mass_matrix for w in windows) if blocked else windows[0].inverse_mass_matrix,
         phase="warmup", adaptation=adaptation, max_num_doublings=max_num_doublings,
-        divergence_threshold=divergence_threshold,
-        collapsed=collapsed, mass_structure=mass_structure,
+        divergence_threshold=divergence_threshold, collapsed=collapsed,
+        mass_structure=mass_structure, block_size=block_size,
     )
     return validate_nuts_chain(target, chain)
 
@@ -820,6 +849,8 @@ def _run_nuts_chunk(target, chain, num_sweeps, *, kernels=None):
     if kernels is None:
         kernels = ChunkRunner(target, chain).kernels
     kernel = kernels["sweep"]
+    blocks = nuts_blocks(chain.model_state.eta.shape[0], chain.block_size)
+    blocked = len(blocks) > 1
     if chain.adaptation is not None:
         update, final, schedule = kernels["update"], kernels["final"], kernels["schedule"]
     samples, diagnostics = [], []
@@ -833,24 +864,37 @@ def _run_nuts_chunk(target, chain, num_sweeps, *, kernels=None):
         if phase == "warmup":
             # The standard Welford recipe ignores grad. Supplying zero avoids
             # recomputing a gradient under the newly refreshed c_f conditional.
-            updated = _checked_call(update,
-                adapt.state, schedule[adapt.completed], state.eta.reshape(-1),
-                jnp.zeros(state.eta.size, dtype=jnp.float64), info.theta.acceptance_rate,
-            )
-            adapt = replace(adapt, state=updated, completed=adapt.completed + 1)
+            windows = adapt.state if blocked else (adapt.state,)
+            updates = update if blocked else (update,)
+            finals = final if blocked else (final,)
+            rates = info.theta.acceptance_rate if blocked else (info.theta.acceptance_rate,)
+            next_windows, next_steps, next_masses = [], [], []
+            for (start, stop), window, upd, fin, rate in zip(
+                blocks, windows, updates, finals, rates
+            ):
+                position = state.eta[start:stop].reshape(-1)
+                updated = _checked_call(upd, window, schedule[adapt.completed], position,
+                                        jnp.zeros(position.size, dtype=jnp.float64), rate)
+                if adapt.completed + 1 == adapt.num_warmup:
+                    block_step, block_mass = fin(updated)
+                else:
+                    block_step, block_mass = updated.step_size, updated.inverse_mass_matrix
+                if not np.isfinite(float(block_step)) or float(block_step) <= 0:
+                    raise FloatingPointError("Warmup produced invalid NUTS step/mass")
+                validate_nuts_mass(block_mass, position.size, chain.mass_structure,
+                                   (stop-start, state.eta.shape[1]))
+                next_windows.append(updated)
+                next_steps.append(block_step)
+                next_masses.append(block_mass)
+            adapt = replace(adapt, state=tuple(next_windows) if blocked else next_windows[0],
+                            completed=adapt.completed + 1)
             if adapt.completed == adapt.num_warmup:
                 phase = "sampling"
-                step, mass = final(updated)
-            else:
-                step, mass = updated.step_size, updated.inverse_mass_matrix
-            if not np.isfinite(float(step)) or float(step) <= 0:
-                raise FloatingPointError("Warmup produced invalid NUTS step/mass")
-            validate_nuts_mass(mass, state.eta.size, chain.mass_structure, state.eta.shape)
-        chain = replace(
-            chain, model_state=state, key=key, step_size=float(step),
-            inverse_mass_matrix=mass, adaptation=adapt, phase=phase,
-            iteration=chain.iteration + 1,
-        )
+            step = jnp.stack(next_steps) if blocked else float(next_steps[0])
+            mass = tuple(next_masses) if blocked else next_masses[0]
+        chain = replace(chain, model_state=state, key=key, step_size=step,
+                        inverse_mass_matrix=mass, adaptation=adapt, phase=phase,
+                        iteration=chain.iteration + 1)
         samples.append(chain.model_state)
         diagnostics.append(info)
     target.gp.validate_field_sites(target.coordinates.eta_to_theta_tilde(chain.model_state.eta))
@@ -1089,7 +1133,7 @@ class ChunkRunner:
             getattr(da, "target_accept", None), getattr(chain, "epsilon_G", None),
             getattr(chain, "max_num_doublings", None),
             getattr(chain, "divergence_threshold", None), getattr(chain, "collapsed", None),
-            getattr(chain, "mass_structure", None),
+            getattr(chain, "mass_structure", None), getattr(chain, "block_size", None),
         )
 
     def __init__(self, target, chain):
@@ -1104,12 +1148,17 @@ class ChunkRunner:
                     key, target, state, step, mass,
                     max_num_doublings=chain.max_num_doublings,
                     divergence_threshold=chain.divergence_threshold,
-                    collapsed=chain.collapsed,
+                    collapsed=chain.collapsed, block_size=chain.block_size,
                 ))
             if adapt is not None:
-                _, update, final = nuts_window_adapter(
-                    adapt.target_accept, chain.mass_structure, chain.model_state.eta.shape)
-                self.kernels.update(update=jax.jit(update), final=final,
+                blocks = nuts_blocks(chain.model_state.eta.shape[0], chain.block_size)
+                adapters = [nuts_window_adapter(
+                    adapt.target_accept, chain.mass_structure,
+                    (stop-start, chain.model_state.eta.shape[1])) for start, stop in blocks]
+                updates = tuple(jax.jit(adapter[1]) for adapter in adapters)
+                finals = tuple(adapter[2] for adapter in adapters)
+                self.kernels.update(update=updates if len(blocks)>1 else updates[0],
+                                    final=finals if len(blocks)>1 else finals[0],
                                     schedule=build_schedule(adapt.num_warmup))
         elif isinstance(chain, MMALAChain):
             self.run = _run_mmala_chunk
@@ -1137,7 +1186,9 @@ class ChunkRunner:
         self.kernels["sweep"] = jax.jit(checkify.checkify(self.kernels["sweep"]))
         for name in ("moments", "update"):
             if name in self.kernels:
-                self.kernels[name] = _checked_adaptation(self.kernels[name])
+                value = self.kernels[name]
+                self.kernels[name] = (tuple(_checked_adaptation(fn) for fn in value)
+                                      if isinstance(value, tuple) else _checked_adaptation(value))
 
     def compile(self, chain):
         """Compile the sweep without consuming keys; adaptation compiles in warmup."""

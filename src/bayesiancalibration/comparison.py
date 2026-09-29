@@ -28,6 +28,7 @@ import numpy as np
 from bayesiancalibration.gibbs import refresh_field_coefficients
 from bayesiancalibration.gp import LibraryGP, fit_library_length_scales
 from bayesiancalibration import mcmc
+from bayesiancalibration.samplers.nuts import nuts_blocks
 from bayesiancalibration.run import load_checkpoint, save_checkpoint
 from bayesiancalibration.state import CalibrationState, SpatialPrior, ThetaStandardization
 from bayesiancalibration.targets import CalibrationTarget
@@ -48,6 +49,9 @@ def validate_config(config: dict) -> None:
     """Reject incompatible experiment settings before fitting or starting jobs."""
     if config.get("nuts_mass_structure", "diagonal") not in ("diagonal", "kronecker", "dense"):
         raise ValueError("nuts_mass_structure must be diagonal, kronecker, or dense")
+    block_size = config.get("nuts_block_size")
+    if block_size is not None and (type(block_size) is not int or block_size < 1):
+        raise ValueError("nuts_block_size must be null or a positive integer site count")
     if config["schema_version"] != 1 or config["chains"] != 4:
         raise ValueError("This experiment requires schema 1 and four chains")
     if config["model"]["site_support"] != "unbounded":
@@ -196,6 +200,7 @@ def load_experiment(path: Path) -> tuple[CalibrationTarget, list, dict]:
     if metadata["implementation_hashes"] != implementation_hashes():
         raise ValueError("Prepared experiment implementation changed; prepare a new experiment")
     target = build_target(arrays, config)
+    nuts_blocks(target.C_theta.shape[0], config.get("nuts_block_size"))
     states = [CalibrationState(*(jnp.asarray(arrays[f"initial.{i}.{name}"])
                                  for name in CalibrationState._fields)) for i in range(4)]
     return target, states, config
@@ -232,6 +237,7 @@ def initialize_chain(target, state, config, method, index):
         max_num_doublings=config["max_num_doublings"],
         divergence_threshold=config["divergence_threshold"], collapsed=method == "collapsed_nuts",
         mass_structure=config.get("nuts_mass_structure", "diagonal"),
+        block_size=config.get("nuts_block_size"),
     )
 
 
@@ -318,8 +324,13 @@ def _run_locked(target, chain, output, config, identity, source_paths, check_swe
             elapsed = time.perf_counter() - start
             arrays = {f"state.{name}": np.asarray(value)
                       for name, value in zip(samples._fields, samples)}
-            arrays.update({f"theta.{name}": np.asarray(value)
-                           for name, value in zip(diagnostics.theta._fields, diagnostics.theta)})
+            for name, value in zip(diagnostics.theta._fields, diagnostics.theta):
+                if isinstance(value, tuple):
+                    # Ragged final blocks stay separate numeric arrays, never object/pickle arrays.
+                    arrays.update({f"theta.{name}.block_{i}": np.asarray(v)
+                                   for i, v in enumerate(value)})
+                else:
+                    arrays[f"theta.{name}"] = np.asarray(value)
             arrays["full_joint_logdensity"] = np.asarray(diagnostics.full_joint_logdensity)
             arrays["site_moved"] = np.asarray(diagnostics.site_moved)
             arrays["iteration"] = np.arange(start_iteration, candidate.iteration + 1)

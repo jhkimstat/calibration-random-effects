@@ -1,6 +1,9 @@
-"""Standard BlackJAX NUTS over the complete site-major eta block."""
+"""Standard BlackJAX NUTS over all sites or sequential conditional site blocks."""
 
 from typing import NamedTuple
+from numbers import Integral
+
+import jax
 
 import jax.numpy as jnp
 from blackjax.mcmc import nuts
@@ -12,7 +15,7 @@ from bayesiancalibration.targets import CalibrationTarget
 
 
 class NUTSSweepInfo(NamedTuple):
-    """Scalar NUTS diagnostics; tuning describes this transition, not the next.
+    """Scalar (all-site) or per-block NUTS diagnostics; tuning describes this transition, not the next.
 
     inverse_mass_matrix is (n*d,) for diagonal or (n*d,n*d) for dense and
     Kronecker structures; M^{-1} = Gamma_site ⊗ Gamma_param in the latter. No density/gradient is cached
@@ -31,11 +34,72 @@ class NUTSSweepInfo(NamedTuple):
     inverse_mass_matrix: Array
 
 
+def nuts_blocks(n: int, block_size: int | None) -> tuple[tuple[int, int], ...]:
+    """Static contiguous site slices, including a smaller final block.
+
+    A shared helper keeps kernel, tuning and checkpoint block layouts identical.
+    None selects the original all-site transition.
+    """
+    if block_size is None:
+        return ((0, n),)
+    if (isinstance(block_size, bool) or not isinstance(block_size, Integral)
+        or not 1 <= block_size <= n):
+        raise ValueError("NUTS block_size must be an integer in [1, number of sites]")
+    return tuple((start, min(start + block_size, n)) for start in range(0, n, block_size))
+
+
 def nuts_sweep(
+    key: Array, target: CalibrationTarget, state: CalibrationState,
+    step_size: Array, inverse_mass_matrix: Array | tuple[Array, ...],
+    *, max_num_doublings: int = 10, divergence_threshold: float = 1000,
+    collapsed: bool = False, block_size: int | None = None,
+) -> tuple[Array, NUTSSweepInfo]:
+    """Sequential complete conditional trees, with current outside-block eta.
+
+    A block counts sites, not scalar coordinates. Multiple blocks use
+    random.split(theta_key, number_of_blocks) in fixed site-major order;
+    one block retains the original unsplit key and diagnostics. Each tree
+    conditions on the latest previous-block results; c_f and other Gibbs
+    variables stay fixed throughout this sweep.
+
+    Multi-block diagnostics are (B,) except logdensity (the final complete
+    theta target value) and inverse_mass_matrix (a tuple of B possibly unequal
+    arrays). step_size is (B,); each mass has its own block dimension.
+    """
+    blocks = nuts_blocks(state.eta.shape[0], block_size)
+    if len(blocks) == 1:
+        return _nuts_transition(
+            key, target, state, step_size, inverse_mass_matrix,
+            max_num_doublings=max_num_doublings,
+            divergence_threshold=divergence_threshold, collapsed=collapsed,
+        )
+    eta, diagnostics = state.eta, []
+    for index, ((start, stop), block_key) in enumerate(zip(
+        blocks, jax.random.split(key, len(blocks))
+    )):
+        eta, info = _nuts_transition(
+            block_key, target, state._replace(eta=eta), step_size[index],
+            inverse_mass_matrix[index], site_slice=(start, stop),
+            max_num_doublings=max_num_doublings,
+            divergence_threshold=divergence_threshold, collapsed=collapsed,
+        )
+        diagnostics.append(info)
+    values = []
+    for name in NUTSSweepInfo._fields:
+        if name == "logdensity":
+            values.append(diagnostics[-1].logdensity)
+        elif name == "inverse_mass_matrix":
+            values.append(tuple(info.inverse_mass_matrix for info in diagnostics))
+        else:
+            values.append(jnp.stack([getattr(info, name) for info in diagnostics]))
+    return eta, NUTSSweepInfo(*values)
+
+
+def _nuts_transition(
     key: Array, target: CalibrationTarget, state: CalibrationState,
     step_size: Array, inverse_mass_matrix: Array,
     *, max_num_doublings: int = 10, divergence_threshold: float = 1000,
-    collapsed: bool = False,
+    collapsed: bool = False, site_slice: tuple[int, int] | None = None,
 ) -> tuple[Array, NUTSSweepInfo]:
     """One all-site transition; collapsed selects the integrated c_f target.
 
@@ -47,18 +111,25 @@ def nuts_sweep(
     convention directly; it is not manually inverted.
     """
 
+    def embed(position):
+        if site_slice is None:
+            return position.reshape(state.eta.shape)
+        start, stop = site_slice
+        return state.eta.at[start:stop].set(position.reshape(stop-start, state.eta.shape[1]))
+
     def density(position):
         if collapsed:
             return target.theta_only_collapsed(
-                position.reshape(state.eta.shape), state.delta, state.sigma_y2,
+                embed(position), state.delta, state.sigma_y2,
                 state.mu_theta, state.Sigma_theta, state.sigma_c2,
             )
         return target.theta_only_uncollapsed(
-            position.reshape(state.eta.shape), state.c_f, state.mu_theta,
+            embed(position), state.c_f, state.mu_theta,
             state.Sigma_theta, state.sigma_c2,
         )
 
-    initial = nuts.init(state.eta.reshape(-1), density)
+    position = state.eta if site_slice is None else state.eta[site_slice[0]:site_slice[1]]
+    initial = nuts.init(position.reshape(-1), density)
     checkify.debug_check(
         jnp.isfinite(initial.logdensity) & jnp.all(jnp.isfinite(initial.logdensity_grad)),
         "NUTS current density/gradient is nonfinite",
@@ -70,7 +141,7 @@ def nuts_sweep(
         jnp.isfinite(updated.logdensity) & jnp.all(jnp.isfinite(updated.logdensity_grad)),
         "NUTS selected density/gradient is nonfinite",
     )
-    return updated.position.reshape(state.eta.shape), NUTSSweepInfo(
+    return embed(updated.position), NUTSSweepInfo(
         info.acceptance_rate, updated.logdensity, info.is_divergent,
         info.is_turning, info.num_integration_steps, info.num_trajectory_expansions,
         info.num_trajectory_expansions >= max_num_doublings,
