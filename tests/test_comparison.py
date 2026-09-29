@@ -30,9 +30,19 @@ class ComparisonTest(unittest.TestCase):
     def setUp(self):
         self.config = json.loads((ROOT / "experiments/comparison.json").read_text())
         self.config.update(num_warmup=2, num_initial=1, chunk_sweeps=1,
-                           production_seconds=2.0, max_num_doublings=1, initial_proposal_variance=.001,
+                           production_seconds=2.0, max_num_doublings=1, initial_proposal_variance=.001, mala_initial_proposal_variance=.001,
                            nuts_initial_step_size=.01, mala_epsilon=.01,
                            mmala_epsilon=.01)
+
+    def test_default_mh_variance_preserves_mala_preconditioner(self):
+        config = json.loads((ROOT / "experiments/comparison.json").read_text())
+        comparison.validate_config(config)
+        target, state, _ = make_fixture(loading_only=True)
+        mh = comparison.initialize_chain(target, state, config, "mh", 0)
+        mala = comparison.initialize_chain(target, state, config, "mala", 0)
+        identity = np.tile(np.eye(2), (2, 1, 1))
+        np.testing.assert_array_equal(mh.V_prop, 1e-6 * identity)
+        np.testing.assert_array_equal(mala.V_prop, identity)
 
     def test_task_mapping_and_independent_streams(self):
         pairs = [comparison.task_coordinates(i) for i in range(20)]

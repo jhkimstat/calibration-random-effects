@@ -28,7 +28,7 @@ class HotPathTest(unittest.TestCase):
         self.target, self.state, self.proposal = make_fixture(loading_only=True)
         self.config = json.loads((Path(__file__).resolve().parents[1]
                                   / "experiments/comparison.json").read_text())
-        self.config.update(num_warmup=2, num_initial=2, max_num_doublings=1, initial_proposal_variance=.001,
+        self.config.update(num_warmup=2, num_initial=2, max_num_doublings=1, initial_proposal_variance=.001, mala_initial_proposal_variance=.001,
                            nuts_initial_step_size=.01, mala_epsilon=.01, mmala_epsilon=.01)
 
     def test_no_static_validation_in_sweeps_and_one_geometry_audit_per_chunk(self):

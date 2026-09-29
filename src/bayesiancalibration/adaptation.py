@@ -4,16 +4,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from numbers import Integral
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-from blackjax.adaptation.mass_matrix import WelfordAlgorithmState, welford_algorithm
+from blackjax.adaptation.mass_matrix import (
+    MassMatrixAdaptationState, WelfordAlgorithmState, welford_algorithm,
+)
 from blackjax.adaptation.step_size import (
     DualAveragingAdaptationState,
     dual_averaging_adaptation,
 )
-from blackjax.adaptation.metric_recipes import lookup_recipe
+from blackjax.adaptation.metric_recipes import MetricCore, lookup_recipe
 from blackjax.adaptation.staged_adaptation import (
     StagedAdaptationState, _make_engine, build_schedule,
 )
@@ -21,18 +24,131 @@ from jax import Array
 from jax.experimental import checkify
 
 
-def nuts_window_adapter(target_accept: float = 0.8):
-    """Embed the exact engine used by BlackJAX 1.6.2 window_adaptation.
+NUTS_MASS_STRUCTURES = ("diagonal", "kronecker", "dense")
 
-    Its high-level driver assumes a fixed density. Gibbs needs its low-level
-    init/update/final triple while rebuilding the conditional each sweep.
-    The private engine is version-sensitive: package versions are recorded
-    and required at restart, and fixed-target driver equivalence is tested.
-    Identity diagonal initialization, zero persistence, Stan regularization,
-    and dual-averaging defaults all come directly from BlackJAX.
+
+def kronecker_factors(covariance: Array, n: int, d: int) -> tuple[Array, Array]:
+    """Partial-trace moment factors of an SPD covariance (nd,nd), site first.
+
+    Gamma_site (n,n) has trace n; Gamma_param (d,d) carries the scale.
+    For separable covariance this recovers its Kronecker product exactly.
+    This custom estimator implements the approved moment approximation,
+    not a matrix-normal likelihood fit. It is also used for structure audits.
     """
 
-    core = lookup_recipe("welford_diag").build_core()
+    blocks = covariance.reshape(n, d, n, d)
+    site = jnp.einsum("iqjq->ij", blocks) / d
+    Gamma_param = jnp.einsum("iqir->qr", blocks) / n
+    Gamma_site = site * (n / jnp.trace(site))
+    return Gamma_site, Gamma_param
+
+
+def validate_nuts_mass(mass, size: int, structure: str, site_shape=None) -> None:
+    """Validate diagonal positivity or dense SPD, plus separability if requested."""
+
+    if structure not in NUTS_MASS_STRUCTURES:
+        raise ValueError("NUTS mass_structure must be diagonal, kronecker, or dense")
+    value = np.asarray(mass)
+    shape = (size,) if structure == "diagonal" else (size, size)
+    if value.shape != shape or not np.all(np.isfinite(value)):
+        raise ValueError("Invalid NUTS inverse mass shape or nonfinite entries")
+    if structure == "diagonal":
+        if np.any(value <= 0):
+            raise ValueError("NUTS diagonal inverse mass must be positive")
+    else:
+        if not np.allclose(value, value.T, rtol=1e-12, atol=1e-14):
+            raise ValueError("NUTS inverse mass must be symmetric")
+        try:
+            np.linalg.cholesky(value)
+        except np.linalg.LinAlgError as exc:
+            raise ValueError("NUTS inverse mass must be positive definite") from exc
+        if structure == "kronecker":
+            if site_shape is None or np.prod(site_shape) != size:
+                raise ValueError("Kronecker mass requires site_shape=(n,d)")
+            factors = kronecker_factors(jnp.asarray(value), *site_shape)
+            if not np.allclose(value, np.kron(*factors), rtol=1e-10, atol=1e-12):
+                raise ValueError("NUTS inverse mass must have Kronecker structure")
+
+
+class KroneckerWelfordState(NamedTuple):
+    """Centered eta moments without an (nd,nd) empirical scatter matrix.
+
+    mean is site-major (nd,), m2_site is (n,n), m2_param is (d,d), and
+    sample_size is scalar. Both scatters are unnormalized partial traces.
+    """
+
+    mean: Array
+    m2_site: Array
+    m2_param: Array
+    sample_size: Array
+
+
+def _kronecker_metric_core(n: int, d: int) -> MetricCore:
+    """Accumulate only sufficient partial traces; BlackJAX has no such core.
+
+    Matrix Welford increments are ((N-1)/N) D D.T and ((N-1)/N) D.T D,
+    where D is eta minus the old mean, shaped (n,d). These equal the partial
+    traces of full Welford scatter, up to floating-point summation order.
+    The selected mass remains dense for the existing BlackJAX kernel.
+    """
+
+    def empty():
+        return KroneckerWelfordState(
+            jnp.zeros(n*d, dtype=jnp.float64), jnp.zeros((n, n), dtype=jnp.float64),
+            jnp.zeros((d, d), dtype=jnp.float64), jnp.asarray(0, dtype=jnp.int64))
+
+    def init(size):
+        if size != n*d:
+            raise ValueError("Kronecker site_shape disagrees with position size")
+        return MassMatrixAdaptationState(jnp.eye(size, dtype=jnp.float64), empty())
+
+    def update(state, position, grad):
+        del grad
+        wc = state.wc_state
+        count = wc.sample_size + 1
+        delta = jnp.asarray(position).reshape(-1) - wc.mean
+        D = delta.reshape(n, d)
+        weight = wc.sample_size / count
+        moments = KroneckerWelfordState(
+            wc.mean + delta / count,
+            wc.m2_site + weight * (D @ D.T),
+            wc.m2_param + weight * (D.T @ D), count)
+        return state._replace(wc_state=moments)
+
+    def final(state):
+        wc = state.wc_state
+        count = wc.sample_size
+        weight, ridge = count / (count + 5), 5e-3 / (count + 5)
+        site = weight * wc.m2_site / ((count - 1) * d) + ridge * jnp.eye(n)
+        Gamma_param = weight * wc.m2_param / ((count - 1) * n) + ridge * jnp.eye(d)
+        Gamma_site = site * (n / jnp.trace(site))
+        return MassMatrixAdaptationState(jnp.kron(Gamma_site, Gamma_param), empty())
+
+    return MetricCore(init, update, final)
+
+
+def nuts_window_adapter(target_accept: float = 0.8, mass_structure: str = "diagonal",
+                        site_shape: tuple[int, int] | None = None):
+    """Standard BlackJAX windows with diagonal, dense or separable eta moments.
+
+    Kronecker accumulates only site and parameter scatter matrices. At each
+    slow-window boundary, regularize each factor with N/(N+5) shrinkage and
+    5e-3/(N+5) identity ridge, normalize the site trace to n, and materialize
+    Gamma_site ⊗ Gamma_param for BlackJAX. Moment storage is O(nd+n²+d²);
+    the selected mass and NUTS kernel arithmetic remain dense.
+    """
+
+    if mass_structure not in NUTS_MASS_STRUCTURES:
+        raise ValueError("NUTS mass_structure must be diagonal, kronecker, or dense")
+    if mass_structure == "kronecker":
+        if (site_shape is None or len(site_shape) != 2
+            or any(not isinstance(x, Integral) or isinstance(x, bool) or x < 1
+                   for x in site_shape)):
+            raise ValueError("Kronecker mass requires site_shape=(n,d)")
+        core = _kronecker_metric_core(*site_shape)
+    else:
+        core = lookup_recipe("welford_diag" if mass_structure == "diagonal"
+                             else "welford_dense").build_core()
     return _make_engine(core, target_acceptance_rate=target_accept)
 
 
@@ -41,7 +157,8 @@ class NUTSAdaptationState:
     """Standard window statistics, separate from model and NUTS tuning.
 
     num_warmup defaults to 1000; completed counts full outer sweeps. State is
-    BlackJAX's unmodified staged state (diagonal Welford + dual averaging).
+    BlackJAX staged state with diagonal/dense Welford or direct Kronecker
+    factor moments, plus dual averaging.
     Schedule uses standard 75/25/50 buffers and its short-warmup handling.
     """
 
@@ -52,7 +169,8 @@ class NUTSAdaptationState:
     state: StagedAdaptationState
 
 
-def validate_nuts_adaptation(adaptation: NUTSAdaptationState, size: int) -> None:
+def validate_nuts_adaptation(adaptation: NUTSAdaptationState, size: int,
+                             mass_structure="diagonal", site_shape=None) -> None:
     """Enforce this chain's window representation and restart counters.
 
     The library engine provides updates; these host checks reject malformed
@@ -95,18 +213,40 @@ def validate_nuts_adaptation(adaptation: NUTSAdaptationState, size: int) -> None
     if any(np.asarray(getattr(da, name)).shape != () for name in da._fields):
         raise ValueError("NUTS dual-averaging statistics must be scalars")
     wc = metric.wc_state
-    if (wc.mean.shape != (size,) or wc.m2.shape != (size,)
+    if (wc.mean.shape != (size,)
         or np.asarray(wc.sample_size).shape != ()
         or np.asarray(wc.sample_size).dtype.kind not in "iu"
-        or int(wc.sample_size) != count or np.any(np.asarray(wc.m2) < 0)):
+        or int(wc.sample_size) != count):
         raise ValueError("NUTS Welford statistics disagree with window schedule")
+    if mass_structure == "kronecker":
+        if not isinstance(wc, KroneckerWelfordState) or site_shape is None:
+            raise ValueError("Kronecker adaptation requires factor scatter statistics")
+        n, d = site_shape
+        scatters = ((wc.m2_site, (n, n)), (wc.m2_param, (d, d)))
+        if not np.isclose(np.trace(wc.m2_site), np.trace(wc.m2_param), rtol=1e-12, atol=1e-14):
+            raise ValueError("Kronecker scatter traces disagree")
+    else:
+        scatters = ((wc.m2, (size,) if mass_structure == "diagonal" else (size, size)),)
+    for value, shape in scatters:
+        scatter = np.asarray(value)
+        if scatter.shape != shape:
+            raise ValueError("Invalid NUTS scatter shape")
+        if count < 2 and np.any(scatter != 0):
+            raise ValueError("NUTS scatter must be zero before two samples")
+        if mass_structure == "diagonal":
+            if np.any(scatter < 0):
+                raise ValueError("NUTS scatter must be nonnegative")
+        else:
+            tolerance = 64 * np.finfo(float).eps * max(1.0, np.linalg.norm(scatter))
+            if (not np.allclose(scatter, scatter.T, rtol=1e-12, atol=tolerance)
+                or np.linalg.eigvalsh((scatter + scatter.T)/2).min() < -tolerance):
+                raise ValueError("NUTS scatter must be symmetric positive semidefinite")
+    validate_nuts_mass(state.inverse_mass_matrix, size, mass_structure, site_shape)
     if (np.asarray(state.step_size).shape != () or float(state.step_size) <= 0
-        or state.inverse_mass_matrix.shape != (size,)
-        or np.any(np.asarray(state.inverse_mass_matrix) <= 0)
         or not np.array_equal(state.inverse_mass_matrix, metric.inverse_mass_matrix)):
         raise ValueError("Invalid NUTS window step size or inverse mass matrix")
     if adaptation.completed == 0:
-        init, _, _ = nuts_window_adapter(adaptation.target_accept)
+        init, _, _ = nuts_window_adapter(adaptation.target_accept, mass_structure, site_shape)
         expected = init(jnp.zeros(size), adaptation.initial_step_size)
         if any(not np.array_equal(a, b) for a, b in zip(
             jax.tree.leaves(state), jax.tree.leaves(expected)

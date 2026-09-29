@@ -23,6 +23,7 @@ from bayesiancalibration.adaptation import (
     NUTSAdaptationState,
     nuts_window_adapter,
     validate_nuts_adaptation,
+    validate_nuts_mass,
     MMALAAdaptationState,
 )
 from blackjax.adaptation.staged_adaptation import build_schedule
@@ -42,7 +43,9 @@ from bayesiancalibration.samplers.metropolis import (
     collapsed_random_walk_sweep,
 )
 from bayesiancalibration.state import CalibrationState
-from bayesiancalibration.samplers.nuts import NUTSSweepInfo, nuts_sweep
+from bayesiancalibration.samplers.nuts import (
+    NUTSSweepInfo, nuts_sweep,
+)
 from bayesiancalibration.samplers.mmala import (
     collapsed_mmala_sweep, validate_mmala_geometry,
 )
@@ -364,7 +367,7 @@ def initialize_random_walk_warmup(
     num_initial: int,
     V_prop: Array | None = None,
 ) -> RandomWalkChain:
-    """Initialize explicitly scheduled warmup; identity is the default tuning.
+    """Initialize scheduled MH warmup; default covariance is 1e-6 I per site.
 
     Both lengths must be declared, with 1 <= num_initial <= num_warmup.
     V_prop is an optional declared SPD (n,d,d) initial covariance. Covariance
@@ -374,7 +377,7 @@ def initialize_random_walk_warmup(
     n = target.C_theta.shape[0]
     d = target.gp.theta_s_tilde.shape[1]
     if V_prop is None:
-        V_prop = jnp.tile(jnp.eye(d, dtype=jnp.float64), (n, 1, 1))
+        V_prop = 1e-6 * jnp.tile(jnp.eye(d, dtype=jnp.float64), (n, 1, 1))
     chain = initialize_random_walk_chain(target, state, key, V_prop)
     adaptation = initialize_random_walk_adaptation(
         num_warmup, num_initial, chain.V_prop
@@ -582,6 +585,9 @@ def initialize_mala_warmup(
     The final averaged epsilon is frozen in production.
     """
 
+    if V_prop is None:
+        n, d = state.eta.shape
+        V_prop = jnp.tile(jnp.eye(d, dtype=jnp.float64), (n, 1, 1))
     initial = initialize_random_walk_warmup(
         target, state, key, num_warmup=num_warmup, num_initial=num_initial,
         V_prop=V_prop,
@@ -645,11 +651,11 @@ def run_mala_warmup(
 
 @dataclass(frozen=True)
 class NUTSChain:
-    """Complete model/key boundary and diagonal all-site NUTS tuning.
+    """Complete model/key boundary and selectable eta-space NUTS tuning.
 
-    step_size is the library integrator scale; inverse_mass_matrix (n*d,)
-    uses BlackJAX's convention. Window statistics are separate and freeze
-    in production. Tree/energy limits are explicit computational settings.
+    inverse_mass_matrix is (n*d,) for diagonal, (n*d,n*d) for dense or
+    Kronecker. All use eta coordinates and BlackJAX's convention. Window
+    statistics are separate and freeze in production, as does step_size.
     No HMC position-density-gradient cache crosses an outer sweep boundary.
     """
 
@@ -663,6 +669,7 @@ class NUTSChain:
     max_num_doublings: int = 10
     divergence_threshold: float = 1000.0
     collapsed: bool = False
+    mass_structure: str = "diagonal"
 
 
 def nuts_gibbs_sweep(
@@ -718,8 +725,7 @@ def validate_nuts_chain(target: CalibrationTarget, chain: NUTSChain) -> NUTSChai
         or chain.max_num_doublings < 1):
         raise ValueError("max_num_doublings must be a positive integer")
     mass = np.asarray(chain.inverse_mass_matrix)
-    if mass.shape != (n*d,) or not np.all(np.isfinite(mass)) or np.any(mass <= 0):
-        raise ValueError("NUTS inverse_mass_matrix must be positive diagonal (n*d,)")
+    validate_nuts_mass(mass, n*d, chain.mass_structure, (n, d))
     if chain.phase not in ("warmup", "sampling"):
         raise ValueError("Invalid NUTS phase")
     adapt = chain.adaptation
@@ -727,7 +733,7 @@ def validate_nuts_chain(target: CalibrationTarget, chain: NUTSChain) -> NUTSChai
         if chain.phase != "sampling":
             raise ValueError("NUTS warmup requires a window schedule")
     else:
-        validate_nuts_adaptation(adapt, n*d)
+        validate_nuts_adaptation(adapt, n*d, chain.mass_structure, (n, d))
         if chain.phase == "warmup":
             if adapt.completed >= adapt.num_warmup or chain.iteration != adapt.completed:
                 raise ValueError("NUTS warmup phase/count mismatch")
@@ -735,7 +741,8 @@ def validate_nuts_chain(target: CalibrationTarget, chain: NUTSChain) -> NUTSChai
         else:
             if adapt.completed != adapt.num_warmup or chain.iteration < adapt.completed:
                 raise ValueError("NUTS production requires completed window adaptation")
-            _, _, final = nuts_window_adapter(adapt.target_accept)
+            _, _, final = nuts_window_adapter(
+                    adapt.target_accept, chain.mass_structure, chain.model_state.eta.shape)
             expected_step, expected_mass = final(adapt.state)
         if float(chain.step_size) != float(expected_step) or not np.array_equal(
             mass, expected_mass
@@ -750,9 +757,9 @@ def validate_nuts_chain(target: CalibrationTarget, chain: NUTSChain) -> NUTSChai
         return target.theta_only_uncollapsed(
             eta, s.c_f, s.mu_theta, s.Sigma_theta, s.sigma_c2
         )
-    grad = jax.grad(density)(s.eta)
-    if not np.all(np.isfinite(np.asarray(grad))):
-        raise ValueError("Current NUTS gradient must be finite")
+    value, grad = jax.value_and_grad(density)(s.eta)
+    if not np.isfinite(float(value)) or not np.all(np.isfinite(np.asarray(grad))):
+        raise ValueError("Current NUTS density/gradient must be finite")
     if adapt is not None:
         adapt = replace(adapt, num_warmup=int(adapt.num_warmup), completed=int(adapt.completed),
                         initial_step_size=float(adapt.initial_step_size),
@@ -767,14 +774,14 @@ def initialize_nuts_chain(
     target: CalibrationTarget, state: CalibrationState, key: Array,
     *, step_size: float, inverse_mass_matrix: Array,
     max_num_doublings: int = 10, divergence_threshold: float = 1000,
-    collapsed: bool = False,
+    collapsed: bool = False, mass_structure: str = "diagonal",
 ) -> NUTSChain:
     """Initialize checked fixed NUTS tuning; select collapse explicitly."""
 
     return validate_nuts_chain(target, NUTSChain(
         state, key, step_size, inverse_mass_matrix,
         max_num_doublings=max_num_doublings, divergence_threshold=divergence_threshold,
-        collapsed=collapsed,
+        collapsed=collapsed, mass_structure=mass_structure,
     ))
 
 
@@ -783,9 +790,9 @@ def initialize_nuts_warmup(
     *, num_warmup: int = 1000, initial_step_size: float = 1.0,
     target_accept: float = 0.8, max_num_doublings: int = 10,
     divergence_threshold: float = 1000,
-    collapsed: bool = False,
+    collapsed: bool = False, mass_structure: str = "diagonal",
 ) -> NUTSChain:
-    """Resolve the standard diagonal window-adaptation defaults explicitly.
+    """Resolve the selected eta-space window-adaptation defaults explicitly.
 
     Standard schedule buffers are 75/25/50, with BlackJAX short-run handling.
     Initial inverse mass is identity; no empirical-covariance MALA/RW rule
@@ -793,7 +800,7 @@ def initialize_nuts_warmup(
     feedback from the NUTS trajectory and current conditional each time.
     """
 
-    init, _, _ = nuts_window_adapter(target_accept)
+    init, _, _ = nuts_window_adapter(target_accept, mass_structure, state.eta.shape)
     adaptation = NUTSAdaptationState(
         num_warmup, 0, initial_step_size, target_accept,
         jax.tree.map(jnp.asarray, init(state.eta.reshape(-1), initial_step_size)),
@@ -802,7 +809,7 @@ def initialize_nuts_warmup(
         state, key, initial_step_size, adaptation.state.inverse_mass_matrix,
         phase="warmup", adaptation=adaptation, max_num_doublings=max_num_doublings,
         divergence_threshold=divergence_threshold,
-        collapsed=collapsed,
+        collapsed=collapsed, mass_structure=mass_structure,
     )
     return validate_nuts_chain(target, chain)
 
@@ -836,8 +843,9 @@ def _run_nuts_chunk(target, chain, num_sweeps, *, kernels=None):
                 step, mass = final(updated)
             else:
                 step, mass = updated.step_size, updated.inverse_mass_matrix
-            if not np.isfinite(float(step)) or float(step) <= 0 or np.any(np.asarray(mass) <= 0):
+            if not np.isfinite(float(step)) or float(step) <= 0:
                 raise FloatingPointError("Warmup produced invalid NUTS step/mass")
+            validate_nuts_mass(mass, state.eta.size, chain.mass_structure, state.eta.shape)
         chain = replace(
             chain, model_state=state, key=key, step_size=float(step),
             inverse_mass_matrix=mass, adaptation=adapt, phase=phase,
@@ -1081,6 +1089,7 @@ class ChunkRunner:
             getattr(da, "target_accept", None), getattr(chain, "epsilon_G", None),
             getattr(chain, "max_num_doublings", None),
             getattr(chain, "divergence_threshold", None), getattr(chain, "collapsed", None),
+            getattr(chain, "mass_structure", None),
         )
 
     def __init__(self, target, chain):
@@ -1098,7 +1107,8 @@ class ChunkRunner:
                     collapsed=chain.collapsed,
                 ))
             if adapt is not None:
-                _, update, final = nuts_window_adapter(adapt.target_accept)
+                _, update, final = nuts_window_adapter(
+                    adapt.target_accept, chain.mass_structure, chain.model_state.eta.shape)
                 self.kernels.update(update=jax.jit(update), final=final,
                                     schedule=build_schedule(adapt.num_warmup))
         elif isinstance(chain, MMALAChain):

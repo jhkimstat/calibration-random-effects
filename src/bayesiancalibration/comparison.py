@@ -46,6 +46,8 @@ def task_coordinates(task_id: int) -> tuple[str, int]:
 
 def validate_config(config: dict) -> None:
     """Reject incompatible experiment settings before fitting or starting jobs."""
+    if config.get("nuts_mass_structure", "diagonal") not in ("diagonal", "kronecker", "dense"):
+        raise ValueError("nuts_mass_structure must be diagonal, kronecker, or dense")
     if config["schema_version"] != 1 or config["chains"] != 4:
         raise ValueError("This experiment requires schema 1 and four chains")
     if config["model"]["site_support"] != "unbounded":
@@ -61,8 +63,10 @@ def validate_config(config: dict) -> None:
         "production_seconds", "mala_epsilon", "mmala_epsilon", "epsilon_G",
         "nuts_initial_step_size", "divergence_threshold", "initial_proposal_variance",
         "mala_target_accept", "mmala_target_accept", "nuts_target_accept",
+        "mala_initial_proposal_variance",
     ):
-        value = config[name]
+        value = (config.get(name, config["initial_proposal_variance"])
+                 if name == "mala_initial_proposal_variance" else config[name])
         if isinstance(value, bool) or not np.isfinite(value) or value <= 0:
             raise ValueError(f"{name} must be finite and positive")
         if name.endswith("target_accept") and value >= 1:
@@ -206,8 +210,11 @@ def initialize_chain(target, state, config, method, index):
     shared = dict(num_warmup=config["num_warmup"])
     if method in ("mh", "mala"):
         n, d = state.eta.shape
+        variance = config["initial_proposal_variance"]
+        if method == "mala":
+            variance = config.get("mala_initial_proposal_variance", variance)
         shared.update(num_initial=config["num_initial"], V_prop=jnp.tile(
-            config["initial_proposal_variance"] * jnp.eye(d), (n, 1, 1)))
+            variance * jnp.eye(d), (n, 1, 1)))
         if method == "mh":
             return mcmc.initialize_random_walk_warmup(target, state, key, **shared)
         return mcmc.initialize_mala_warmup(
@@ -224,6 +231,7 @@ def initialize_chain(target, state, config, method, index):
         target_accept=config["nuts_target_accept"],
         max_num_doublings=config["max_num_doublings"],
         divergence_threshold=config["divergence_threshold"], collapsed=method == "collapsed_nuts",
+        mass_structure=config.get("nuts_mass_structure", "diagonal"),
     )
 
 

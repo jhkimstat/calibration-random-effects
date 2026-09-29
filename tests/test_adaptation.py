@@ -158,18 +158,22 @@ class WarmupIntegrationTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "phase='warmup'"):
             run_random_walk_warmup(target, production, 1)
 
-    def test_identity_short_warmup_and_repeated_rejections(self):
+    def test_small_variance_short_warmup_and_repeated_rejections(self):
         for total, initial_count in ((1, 1), (3, 3)):
             target, state, initial = reference.make_fixture()
             chain = initialize_random_walk_warmup(
                 target, state, jax.random.key(961),
                 num_warmup=total, num_initial=initial_count,
             )
-            np.testing.assert_array_equal(chain.V_prop, np.tile(np.eye(2), (2, 1, 1)))
-            # A one-state estimator is zero; this three-sweep fixture also never moves.
-            with self.assertRaises(WarmupTuningError) as failure:
-                run_random_walk_warmup(target, chain)
-            self.assertEqual(failure.exception.diagnostics["completed"], total)
+            np.testing.assert_array_equal(chain.V_prop, 1e-6 * np.tile(np.eye(2), (2, 1, 1)))
+            if total == 1:
+                # A single completed position cannot estimate covariance.
+                with self.assertRaises(WarmupTuningError) as failure:
+                    run_random_walk_warmup(target, chain)
+                self.assertEqual(failure.exception.diagnostics["completed"], total)
+            else:
+                finished, _, _ = run_random_walk_warmup(target, chain)
+                self.assertEqual(finished.phase, "sampling")
             self.assertEqual(chain.phase, "warmup")
         target, state, initial = reference.make_fixture(True)
         chain = initialize_random_walk_warmup(

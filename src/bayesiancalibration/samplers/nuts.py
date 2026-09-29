@@ -14,7 +14,8 @@ from bayesiancalibration.targets import CalibrationTarget
 class NUTSSweepInfo(NamedTuple):
     """Scalar NUTS diagnostics; tuning describes this transition, not the next.
 
-    inverse_mass_matrix is diagonal (n*d,). No density/gradient is cached
+    inverse_mass_matrix is (n*d,) for diagonal or (n*d,n*d) for dense and
+    Kronecker structures; M^{-1} = Gamma_site ⊗ Gamma_param in the latter. No density/gradient is cached
     between Gibbs sweeps. reached_max_doublings records the expansion cap;
     is_turning/is_divergent distinguish the other termination conditions.
     """

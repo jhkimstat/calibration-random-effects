@@ -24,6 +24,7 @@ from bayesiancalibration.adaptation import (
     MALAStepSizeAdaptationState,
     RandomWalkAdaptationState,
     NUTSAdaptationState,
+    KroneckerWelfordState,
     MMALAAdaptationState,
 )
 from bayesiancalibration.mcmc import (
@@ -143,7 +144,8 @@ def save_checkpoint(
         nuts_metadata = {
             "max_num_doublings": chain.max_num_doublings,
             "divergence_threshold": chain.divergence_threshold,
-            "integrator": "velocity_verlet", "mass_matrix": "diagonal",
+            "integrator": "velocity_verlet", "mass_matrix": chain.mass_structure,
+            "coordinates": "eta-v1",
         }
     elif not is_mmala:
         arrays["sampler.V_prop"] = np.asarray(chain.V_prop)
@@ -179,7 +181,7 @@ def save_checkpoint(
         arrays["window.inverse_mass_matrix"] = np.asarray(window.inverse_mass_matrix)
         arrays["window.schedule"] = np.asarray(build_schedule(adaptation.num_warmup))
         adaptation_metadata = {
-            "protocol": "blackjax-staged-welford-diag-v1",
+            "protocol": "eta-staged-factor-moments-v2",
             "num_warmup": adaptation.num_warmup, "completed": adaptation.completed,
             "initial_step_size": adaptation.initial_step_size,
             "target_accept": adaptation.target_accept,
@@ -349,7 +351,8 @@ def load_checkpoint(
         if is_nuts:
             config = metadata["nuts"]
             if (not isinstance(config, dict) or config.get("integrator") != "velocity_verlet"
-                or config.get("mass_matrix") != "diagonal"
+                or config.get("mass_matrix") not in ("diagonal", "dense", "kronecker")
+                or config.get("coordinates") != "eta-v1"
                 or metadata["step_size_adaptation"] is not None
                 or any(name.startswith(("step_size.", "adaptation.")) for name in arrays)
                 or "sampler.V_prop" in arrays or "sampler.epsilon" in arrays):
@@ -357,7 +360,7 @@ def load_checkpoint(
             adaptation = None
             am = metadata["adaptation"]
             if am is not None:
-                if (am.get("protocol") != "blackjax-staged-welford-diag-v1"
+                if (am.get("protocol") != "eta-staged-factor-moments-v2"
                     or am.get("buffers") != [75, 25, 50]
                     or am.get("imm_shrinkage_to_previous") != 0.0
                     or am.get("dual_averaging") != {"t0": 10, "gamma": 0.05, "kappa": 0.75}):
@@ -368,9 +371,11 @@ def load_checkpoint(
                     jnp.asarray(arrays[f"window.ss.{name}"])
                     for name in DualAveragingAdaptationState._fields
                 ))
-                wc = WelfordAlgorithmState(*(
+                moments_type = (KroneckerWelfordState if config["mass_matrix"] == "kronecker"
+                                else WelfordAlgorithmState)
+                wc = moments_type(*(
                     jnp.asarray(arrays[f"window.wc.{name}"])
-                    for name in WelfordAlgorithmState._fields
+                    for name in moments_type._fields
                 ))
                 mass = jnp.asarray(arrays["window.inverse_mass_matrix"])
                 window = StagedAdaptationState(
@@ -389,7 +394,7 @@ def load_checkpoint(
                 state, key, float(tuning[0]), jnp.asarray(tuning[1]),
                 metadata["iteration"], metadata["phase"], adaptation,
                 config["max_num_doublings"], config["divergence_threshold"],
-                metadata["sampler"] == "collapsed_nuts",
+                metadata["sampler"] == "collapsed_nuts", config["mass_matrix"],
             )
             return validate_nuts_chain(target, chain), metadata
         if any(name.startswith("window.") for name in arrays) or metadata["nuts"] is not None:
