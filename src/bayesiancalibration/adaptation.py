@@ -21,7 +21,7 @@ from blackjax.adaptation.staged_adaptation import (
     StagedAdaptationState, _make_engine, build_schedule,
 )
 from jax import Array
-from jax.experimental import checkify
+from bayesiancalibration.validation import check_quantity
 
 
 NUTS_MASS_STRUCTURES = ("diagonal", "kronecker", "dense")
@@ -171,10 +171,10 @@ class NUTSAdaptationState:
 
 def validate_nuts_adaptation(adaptation: NUTSAdaptationState, size: int,
                              mass_structure="diagonal", site_shape=None) -> None:
-    """Enforce this chain's window representation and restart counters.
+    """Enforce this chain's window representation and sweep counters.
 
     The library engine provides updates; these host checks reject malformed
-    or inconsistent checkpoint/configuration values without repairing them.
+    or inconsistent configuration values without repairing them.
     """
 
     if not isinstance(adaptation, NUTSAdaptationState):
@@ -313,7 +313,7 @@ class MMALAAdaptationState:
 def validate_mala_step_size_adaptation(
     adaptation: MALAStepSizeAdaptationState, completed: int
 ) -> MALAStepSizeAdaptationState:
-    """Check DA configuration/state at a completed warmup/restart boundary.
+    """Check DA configuration/state at a completed warmup boundary.
 
     Library utilities do not enforce this Gibbs sampler's scalar float64
     representation, configuration, or sweep counters. This checker reports
@@ -454,9 +454,11 @@ def update_random_walk_adaptation(
         # Do not use a tolerance or hold nonzero, indefinite/nonfinite estimates.
         zero = jnp.all(S_hat == 0, axis=(-2, -1))
         proposal = jnp.where(zero[:, None, None], V_prop, proposal)
-        checkify.debug_check(
-            jnp.all(jnp.isfinite(jnp.linalg.cholesky(proposal))),
-            "D07 covariance adaptation produced non-SPD/nonfinite tuning",
+        finite_factors = jnp.all(jnp.isfinite(jnp.linalg.cholesky(proposal)), axis=(-2, -1))
+        check_quantity(
+            jnp.all(finite_factors), update="adaptation", quantity="V_prop",
+            role="next", site=jnp.argmax(~finite_factors), criterion="positive_definite_finite",
+            description="D07 covariance adaptation produced non-SPD/nonfinite tuning",
         )
         return proposal
 
@@ -470,7 +472,7 @@ def update_random_walk_adaptation(
 def validate_random_walk_adaptation(
     adaptation: RandomWalkAdaptationState, n: int, d: int
 ) -> RandomWalkAdaptationState:
-    """Check restartable schedule, counters, and estimator arrays outside JIT.
+    """Check warmup schedule, counters, and estimator arrays outside JIT.
 
     Standard array checks cannot enforce this sampler's phase/count rules;
     this boundary rejects invalid saved statistics without modifying them.

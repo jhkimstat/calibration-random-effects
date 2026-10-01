@@ -13,6 +13,8 @@ from scipy.stats import multivariate_normal
 
 from bayesiancalibration.gp import (
     LibraryGP,
+    cv_nlpd,
+    cv_wmse,
     fit_library_length_scales,
     profile_log_likelihood,
 )
@@ -211,6 +213,106 @@ class ProfileFittingTest(unittest.TestCase):
                 self.theta_s, self.F_s,
                 starts=np.array([[10.0]]), gtol=1e-6, ftol=1e-9,
                 maxiter=100, jitter=1e-6,
+            )
+
+
+class CrossValidationFittingTest(unittest.TestCase):
+    def setUp(self) -> None:
+        rng = np.random.default_rng(102)
+        self.theta_s = np.array([[-1.6, 0.2], [-0.8, 1.0], [0.1, -0.7],
+                                 [0.7, 0.5], [1.4, -0.3], [2.0, 1.1]])
+        C_ss = _numpy_kernel(self.theta_s, self.theta_s, np.array([0.9, 1.3]))
+        self.F_s = np.linalg.cholesky(C_ss) @ rng.normal(size=(6, 3))
+
+    def test_foldwise_density_matches_independent_scipy_reference(self) -> None:
+        log_lambda_c = np.log([1.1, 0.8])
+        C_ss = _numpy_kernel(self.theta_s, self.theta_s, np.exp(log_lambda_c))
+        reference = []
+        reference_wmse = []
+        for j in range(len(self.theta_s)):
+            training = np.arange(len(self.theta_s)) != j
+            C_minus = C_ss[np.ix_(training, training)]
+            k_j_minus = C_ss[j, training]
+            F_minus = self.F_s[training]
+            c_hat = k_j_minus @ np.linalg.solve(C_minus, F_minus)
+            sigma_c2_minus = np.sum(
+                F_minus * np.linalg.solve(C_minus, F_minus), axis=0
+            ) / (len(self.theta_s) - 1)
+            C_pred = (1.0 - k_j_minus @ np.linalg.solve(C_minus, k_j_minus))
+            C_pred = C_pred * np.diag(sigma_c2_minus)
+            reference.append(-multivariate_normal.logpdf(
+                self.F_s[j], mean=c_hat, cov=C_pred
+            ))
+            reference_wmse.append(
+                np.sum((self.F_s[j] - c_hat) ** 2 / np.diag(C_pred))
+            )
+        np.testing.assert_allclose(
+            cv_nlpd(log_lambda_c, self.theta_s, self.F_s),
+            np.mean(reference), rtol=1e-12, atol=1e-12,
+        )
+        np.testing.assert_allclose(
+            cv_wmse(log_lambda_c, self.theta_s, self.F_s),
+            np.mean(reference_wmse), rtol=1e-12, atol=1e-12,
+        )
+
+        objective = lambda xi: cv_nlpd(xi, self.theta_s, self.F_s)
+        gradient = jax.jit(jax.grad(objective))(jnp.asarray(log_lambda_c))
+        h = 1e-5
+        finite_difference = np.array([
+            (float(objective(log_lambda_c + h * np.eye(2)[q]))
+             - float(objective(log_lambda_c - h * np.eye(2)[q]))) / (2 * h)
+            for q in range(2)
+        ])
+        np.testing.assert_allclose(gradient, finite_difference, rtol=1e-6, atol=1e-6)
+
+        wmse_objective = lambda xi: cv_wmse(xi, self.theta_s, self.F_s)
+        wmse_gradient = jax.jit(jax.grad(wmse_objective))(jnp.asarray(log_lambda_c))
+        wmse_difference = np.array([
+            (float(wmse_objective(log_lambda_c + h * np.eye(2)[q]))
+             - float(wmse_objective(log_lambda_c - h * np.eye(2)[q]))) / (2 * h)
+            for q in range(2)
+        ])
+        np.testing.assert_allclose(wmse_gradient, wmse_difference,
+                                   rtol=1e-6, atol=1e-6)
+
+    def test_multistart_minimizes_cv_objective_and_rejects_invalid_fold(self) -> None:
+        starts = np.array([[-0.7, -0.4], [0.0, 0.0], [0.5, 0.5]])
+        fit = fit_library_length_scales(
+            self.theta_s, self.F_s, starts=starts,
+            gtol=1e-6, ftol=1e-10, maxiter=300, method="cv_nlpd",
+        )
+        self.assertEqual(fit.method, "cv_nlpd")
+        self.assertTrue(any(a.success for a in fit.attempts))
+        self.assertLessEqual(fit.objective, min(
+            float(cv_nlpd(start, self.theta_s, self.F_s)) for start in starts
+        ))
+        np.testing.assert_allclose(
+            fit.objective, cv_nlpd(fit.log_lambda_c, self.theta_s, self.F_s)
+        )
+        self.assertTrue(np.all(np.asarray(fit.profiled_variances) > 0))
+        wmse_fit = fit_library_length_scales(
+            self.theta_s, self.F_s, starts=starts,
+            gtol=1e-6, ftol=1e-10, maxiter=300, method="cv_wmse",
+        )
+        self.assertEqual(wmse_fit.method, "cv_wmse")
+        self.assertLessEqual(wmse_fit.objective, min(
+            float(cv_wmse(start, self.theta_s, self.F_s)) for start in starts
+        ))
+        np.testing.assert_allclose(
+            wmse_fit.objective,
+            cv_wmse(wmse_fit.log_lambda_c, self.theta_s, self.F_s),
+        )
+        with self.assertRaisesRegex(ValueError, "method"):
+            fit_library_length_scales(
+                self.theta_s, self.F_s, starts=starts, gtol=1e-6,
+                ftol=1e-10, maxiter=100, method="invalid",
+            )
+        one_nonzero_row = np.zeros_like(self.F_s)
+        one_nonzero_row[0] = 1.0
+        with self.assertRaisesRegex(ValueError, "No length-scale fit converged"):
+            fit_library_length_scales(
+                self.theta_s, one_nonzero_row, starts=starts[:1],
+                gtol=1e-6, ftol=1e-10, maxiter=100, method="cv_nlpd",
             )
 
 

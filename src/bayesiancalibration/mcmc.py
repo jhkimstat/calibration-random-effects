@@ -13,6 +13,11 @@ from blackjax.adaptation.step_size import dual_averaging_adaptation
 from jax import Array
 from jax.experimental import checkify
 
+from bayesiancalibration.validation import (
+    SamplingError, chain_context, check_quantity, validate_control, validate_key,
+    validate_model_state, validate_spd,
+)
+
 from bayesiancalibration.adaptation import (
     MALAStepSizeAdaptationState,
     RandomWalkAdaptationState,
@@ -54,7 +59,7 @@ from bayesiancalibration.targets import CalibrationTarget
 
 @dataclass(frozen=True)
 class RandomWalkChain:
-    """Restartable state, distinct from fixed target and returned diagnostics.
+    """Local model boundary, distinct from fixed target and returned diagnostics.
 
     model_state holds only model variables; key is the next unused scalar
     JAX key; V_prop (n,d,d) is tuning for the next sweep. iteration counts
@@ -73,7 +78,7 @@ class RandomWalkChain:
 
 @dataclass(frozen=True)
 class MALAChain:
-    """Restartable MALA model/key/tuning with separate warmup statistics.
+    """MALA model/key/tuning with separate warmup statistics.
 
     V_prop (n,d,d) excludes epsilon^2. epsilon is a positive scalar for the
     next sweep; optional step_size_adaptation tunes it only during warmup.
@@ -107,8 +112,11 @@ class GibbsSweepInfo(NamedTuple):
 class WarmupTuningError(ValueError):
     """A completed MH/MALA warmup cannot freeze a site with zero empirical scatter."""
 
-    def __init__(self, adaptation):
+    def __init__(self, adaptation, *, chain=None, chain_index=None, batch=None):
         self.diagnostics = {
+            **(chain_context(chain, chain_index) if chain is not None else {}),
+            "update": "adaptation", "quantity": "V_prop", "role": "next",
+            "batch": list(batch) if batch is not None else None,
             "completed": adaptation.completed,
             "zero_covariance_sites": np.flatnonzero(np.all(
                 np.asarray(adaptation.moments.m2) == 0, axis=(-2, -1)
@@ -137,7 +145,7 @@ def collapsed_gibbs_sweep(
     c_f immediately after theta, even when every site proposal is rejected.
 
     Eight subkeys are split once: next unused key, then seven update keys in
-    schedule order. This split-8-v1 protocol is part of checkpoint metadata.
+    schedule order. The split-8-v1 protocol is shared by all methods.
     Inputs must be valid; checked orchestration validates outside JIT.
     epsilon=None selects random walk. A declared positive scalar epsilon
     selects MALA with V_prop as its unscaled covariance preconditioner.
@@ -153,18 +161,23 @@ def collapsed_gibbs_sweep(
         kd, target.y_tilde, state.c_f, target.R, Omega_y,
         target.m_delta_0, target.V_delta_0,
     )
+    check_quantity(jnp.all(jnp.isfinite(delta)), update="delta", quantity="delta")
     sigma_y2 = sample_branch_noise(
         ky, target.y_tilde, state.c_f, delta, target.R, target.branch_sizes,
         target.alpha_y_0, target.beta_y_0,
     )
+    check_quantity(jnp.all(jnp.isfinite(sigma_y2)), update="sigma_y2", quantity="sigma_y2")
+    check_quantity(jnp.all(sigma_y2 > 0), update="sigma_y2", quantity="sigma_y2", criterion="positive")
     mu_theta = sample_spatial_mean(
         km, theta_tilde, target.C_theta, state.Sigma_theta,
         target.spatial_prior.m_theta_0, target.spatial_prior.V_theta_0,
     )
+    check_quantity(jnp.all(jnp.isfinite(mu_theta)), update="mu_theta", quantity="mu_theta")
     Sigma_theta = sample_spatial_covariance(
         kS, theta_tilde, target.C_theta, mu_theta,
         target.spatial_prior.nu_theta_0, target.spatial_prior.S_theta_0,
     )
+    check_quantity(jnp.all(jnp.isfinite(Sigma_theta)), update="Sigma_theta", quantity="Sigma_theta")
     r, k = target.gp.F_s.shape
     m_f_given_s, C_f_given_s, _ = target.gp.conditional_moments(
         theta_tilde, jnp.ones(k, dtype=jnp.float64)
@@ -173,6 +186,8 @@ def collapsed_gibbs_sweep(
         kc, state.c_f, m_f_given_s, C_f_given_s, target.gp.q_s, r,
         target.branch_sizes, target.alpha_c_0, target.beta_c_0,
     )
+    check_quantity(jnp.all(jnp.isfinite(sigma_c2)), update="sigma_c2", quantity="sigma_c2")
+    check_quantity(jnp.all(sigma_c2 > 0), update="sigma_c2", quantity="sigma_c2", criterion="positive")
     if _theta_transition is not None:
         conditioned = CalibrationState(
             state.eta, state.c_f, delta, sigma_y2, mu_theta, Sigma_theta, sigma_c2
@@ -188,6 +203,7 @@ def collapsed_gibbs_sweep(
             kt, target, state.eta, delta, sigma_y2, mu_theta, Sigma_theta,
             sigma_c2, V_prop, epsilon,
         )
+    check_quantity(jnp.all(jnp.isfinite(eta)), update="eta", quantity="eta", role="selected")
     m_f_given_s, _, Sigma_f_given_s = target.gp.conditional_moments(
         target.coordinates.eta_to_theta_tilde(eta), sigma_c2
     )
@@ -196,31 +212,53 @@ def collapsed_gibbs_sweep(
         kf, target.y_tilde, m_f_given_s, Sigma_f_given_s,
         target.R, d_delta, Omega_y,
     )
+    check_quantity(jnp.all(jnp.isfinite(c_f)), update="c_f", quantity="c_f")
     new_state = CalibrationState(
         eta, c_f, delta, sigma_y2, mu_theta, Sigma_theta, sigma_c2
     )
     joint = target.full_joint_uncollapsed(*new_state)
-    # Device reductions only: do not repeat factorizations or evaluate another density.
-    checkify.debug_check(
-        jnp.all(jnp.stack([jnp.all(jnp.isfinite(x)) for x in new_state]))
-        & jnp.all(sigma_y2 > 0) & jnp.all(sigma_c2 > 0),
-        "Gibbs sweep produced invalid model state",
-    )
-    checkify.debug_check(
-        jnp.isfinite(joint) & jnp.isfinite(theta_info.logdensity)
-        & jnp.all(jnp.isfinite(theta_info.acceptance_rate)),
-        "Gibbs sweep produced nonfinite diagnostics",
-    )
+    # Device reductions only: do not repeat factors or evaluate another density.
+    check_quantity(jnp.isfinite(joint), update="joint", quantity="full_joint_logdensity", role="selected")
+    check_quantity(jnp.isfinite(theta_info.logdensity), update="eta", quantity="logdensity", role="selected")
+    check_quantity(jnp.all(jnp.isfinite(theta_info.acceptance_rate)), update="eta", quantity="acceptance_rate", role="selected")
     return new_state, next_key, GibbsSweepInfo(theta_info, joint, jnp.any(eta != state.eta, axis=1))
 
 
-def _checked_call(kernel, *args):
-    """Surface JAX's functional errors before advancing the host chain boundary."""
+def _checked_call(kernel, *args, chain, chain_index=None, stage="sweep", quantity=None,
+                  role=None, block=None, target=None, diagnostic=False, batch=None):
+    """Report the first device failure before advancing a host model boundary."""
     error, result = kernel(*args)
     message = error.get()
     if message is not None:
-        raise FloatingPointError(message)
+        attempted = (result[0] if isinstance(result, tuple) and isinstance(result[0], CalibrationState) else None)
+        attempted_tuning = None
+        if stage == "adaptation":
+            attempted_tuning = {}
+            for path, value in jax.tree_util.tree_flatten_with_path(result)[0]:
+                blocked_nuts = (isinstance(chain, NUTSChain)
+                                and len(nuts_blocks(chain.model_state.eta.shape[0], chain.block_size)) > 1)
+                prefix = "window" if blocked_nuts else "step_size"
+                if quantity == "V_prop":
+                    prefix = "moments" if path[0].idx == 0 else "V_prop"
+                    path = path[1:]
+                suffix = ".".join(str(getattr(part, "name", getattr(part, "idx", ""))) for part in path)
+                attempted_tuning[prefix + ("." + suffix if suffix else "")] = value
+        raise SamplingError(message, chain, chain_index=chain_index,
+                            stage=stage, quantity=quantity, role=role, block=block,
+                            attempted_state=attempted, target=target, diagnostic=diagnostic,
+                            batch=batch, attempted_tuning=attempted_tuning)
     return result
+
+
+def _audit_geometry(target, chain, *, chain_index=None, batch, diagnostic=False):
+    """Apply the existing GP criterion at a labeled completed-state boundary."""
+    try:
+        target.gp.validate_field_sites(target.coordinates.eta_to_theta_tilde(chain.model_state.eta))
+    except (ValueError, np.linalg.LinAlgError) as error:
+        raise SamplingError(str(error), chain, chain_index=chain_index,
+                            stage="geometry", quantity="gp_field_covariance",
+                            role="selected", sweep=chain.iteration, batch=batch,
+                            attempted_state=chain.model_state, target=target, diagnostic=diagnostic) from error
 
 
 def _check_chain_control(chain, chain_type):
@@ -240,14 +278,20 @@ def _check_chain_control(chain, chain_type):
         raise ValueError("Production requires completed warmup")
 
 
-def _checked_adaptation(function):
+def _checked_adaptation(function, quantity):
     """Check only updated numbers; never rebuild schedules or validate old tuning."""
     def update(*args):
         result = function(*args)
-        checkify.debug_check(
-            jnp.all(jnp.stack([jnp.all(jnp.isfinite(x)) for x in jax.tree.leaves(result)])),
-            "Warmup produced nonfinite adaptation state",
-        )
+        for path, value in jax.tree_util.tree_flatten_with_path(result)[0]:
+            # Covariance adaptation returns moments and V_prop separately;
+            # other named fields retain their statistical names.
+            prefix = quantity
+            if quantity == "covariance":
+                prefix = "moments" if path[0].idx == 0 else "V_prop"
+                path = path[1:]
+            suffix = ".".join(str(getattr(part, "name", getattr(part, "idx", ""))) for part in path)
+            check_quantity(jnp.all(jnp.isfinite(value)), update="adaptation",
+                           quantity=prefix + ("." + suffix if suffix else ""), role="next")
         return result
     return jax.jit(checkify.checkify(update))
 
@@ -263,66 +307,15 @@ def _check_diffusion(epsilon, proposal=1.0):
         raise FloatingPointError("Warmup produced invalid epsilon/diffusion")
 
 
-def validate_random_walk_chain(
-    target: CalibrationTarget, chain: RandomWalkChain
-) -> RandomWalkChain:
-    """Validate and normalize a completed chain boundary outside JIT.
-
-    A model-specific boundary checker is needed because array libraries do
-    not know the model's shapes, positive variances, or GP geometry. Used at
-    initialization, before/after checked runs, and when saving/loading state.
-    No clipping, jitter, repair, or random draws occur during validation.
-    """
-
-    if not isinstance(chain, RandomWalkChain):
-        raise ValueError("chain must be a RandomWalkChain")
-    if not jax.config.jax_enable_x64:
-        raise ValueError("Gibbs sampling requires jax_enable_x64=True")
-    if (
-        isinstance(chain.iteration, bool)
-        or not isinstance(chain.iteration, Integral) or chain.iteration < 0
-    ):
-        raise ValueError("iteration must be a nonnegative integer")
-    if chain.phase not in ("warmup", "sampling"):
-        raise ValueError("phase must be 'warmup' or 'sampling'")
+def _validate_metropolis_boundary(target, chain):
+    """Common MH/MALA model, key and covariance-schedule checks without a surrogate chain."""
+    validate_control(chain.iteration, chain.phase)
+    validate_key(chain.key)
     if chain.phase == "warmup" and chain.adaptation is None:
         raise ValueError("Warmup phase requires adaptation state")
-    try:
-        key_data = jax.random.key_data(chain.key)
-        jax.random.split(chain.key, 2)
-    except (TypeError, ValueError) as error:
-        raise ValueError("key must be a scalar JAX PRNG key") from error
-    if key_data.ndim != 1:
-        raise ValueError("key must be a scalar JAX PRNG key")
-    if not isinstance(chain.model_state, CalibrationState):
-        raise ValueError("model_state must be a CalibrationState")
-    n = target.C_theta.shape[0]
-    k = target.gp.F_s.shape[1]
-    d = target.gp.theta_s_tilde.shape[1]
-    shapes = ((n, d), (n*k,), (k,), (len(target.branch_sizes),),
-              (d,), (d, d), (k,))
-    checked = []
-    for name, value, shape in zip(CalibrationState._fields, chain.model_state, shapes):
-        value_np = np.asarray(value, dtype=np.float64)
-        if value_np.shape != shape or not np.all(np.isfinite(value_np)):
-            raise ValueError(f"{name} must be finite with shape {shape}")
-        if name in ("sigma_y2", "sigma_c2") and np.any(value_np <= 0):
-            raise ValueError(f"{name} must be positive")
-        checked.append(jnp.asarray(value_np))
-    state = CalibrationState(*checked)
-    for name, value, shape in (
-        ("Sigma_theta", state.Sigma_theta, (d, d)),
-        ("V_prop", chain.V_prop, (n, d, d)),
-    ):
-        matrix = np.asarray(value, dtype=np.float64)
-        if matrix.shape != shape or not np.all(np.isfinite(matrix)):
-            raise ValueError(f"{name} must be finite with shape {shape}")
-        if not np.array_equal(matrix, np.swapaxes(matrix, -1, -2)):
-            raise ValueError(f"{name} must be symmetric")
-        try:
-            np.linalg.cholesky(matrix)
-        except np.linalg.LinAlgError as error:
-            raise ValueError(f"{name} must be positive definite") from error
+    state = validate_model_state(target, chain.model_state)
+    n, d = state.eta.shape
+    proposal = validate_spd(chain.V_prop, (n, d, d), "V_prop")
     adaptation = chain.adaptation
     if adaptation is not None:
         validate_random_walk_adaptation(adaptation, n, d)
@@ -341,13 +334,18 @@ def validate_random_walk_chain(
             or adaptation.num_initial == adaptation.num_warmup
         ) and not np.array_equal(chain.V_prop, adaptation.initial_V_prop):
             raise ValueError("The initial fixed period must retain initial_V_prop")
-    target.gp.validate_field_sites(target.coordinates.eta_to_theta_tilde(state.eta))
-    if not np.isfinite(float(target.full_joint_uncollapsed(*state))):
-        raise ValueError("Full joint log density must be finite at a chain boundary")
-    return RandomWalkChain(
-        state, chain.key, jnp.asarray(chain.V_prop, dtype=jnp.float64),
-        int(chain.iteration), chain.phase, adaptation,
-    )
+    return state, proposal, adaptation
+
+
+def validate_random_walk_chain(
+    target: CalibrationTarget, chain: RandomWalkChain
+) -> RandomWalkChain:
+    """Validate the model and declared MH tuning at initialization, without repair."""
+    if not isinstance(chain, RandomWalkChain):
+        raise ValueError("chain must be a RandomWalkChain")
+    state, proposal, adaptation = _validate_metropolis_boundary(target, chain)
+    return replace(chain, model_state=state, V_prop=proposal,
+                   iteration=int(chain.iteration), adaptation=adaptation)
 
 
 def initialize_random_walk_chain(
@@ -387,30 +385,32 @@ def initialize_random_walk_warmup(
     )
 
 
-def _run_metropolis_chunk(
+def _run_metropolis_batch(
     target: CalibrationTarget, chain: RandomWalkChain | MALAChain, num_sweeps: int,
-    *, kernels=None,
+    *, kernels=None, diagnostic=False, chain_index=None,
 ) -> tuple[RandomWalkChain | MALAChain, CalibrationState, GibbsSweepInfo]:
     """Share complete-sweep recording/failure logic across both phases.
 
     This model-specific orchestration keeps PRNG, coefficient refresh, and
     validation identical in warmup/production. Proposal adaptation occurs
     only after a completed warmup sweep, for use in the next sweep.
-    Public drivers prevent chunks from mixing warmup and retained draws.
+    Public drivers prevent batches from mixing warmup and retained draws.
     """
 
     is_mala = isinstance(chain, MALAChain)
     if kernels is None:
-        kernels = ChunkRunner(target, chain).kernels
+        kernels = SweepRunner(target, chain).kernels
     kernel, adapt_kernel = kernels["sweep"], kernels["moments"]
     step_size_adaptation = chain.step_size_adaptation if is_mala else None
     if step_size_adaptation is not None:
         da_update, da_final = kernels["update"], kernels["final"]
+    batch = (chain.iteration + 1, chain.iteration + num_sweeps)
     samples, diagnostics = [], []
     for _ in range(num_sweeps):
         epsilon = chain.epsilon if is_mala else None
         state, next_key, info = _checked_call(kernel,
-            chain.key, chain.model_state, chain.V_prop, epsilon
+            chain.key, chain.model_state, chain.V_prop, epsilon,
+            chain=chain, chain_index=chain_index, target=target, diagnostic=diagnostic, batch=batch,
         )
         proposal, adaptation, phase = chain.V_prop, chain.adaptation, chain.phase
         if phase == "warmup":
@@ -420,7 +420,8 @@ def _run_metropolis_chunk(
                 and adaptation.num_initial < adaptation.num_warmup
             )
             moments, proposal = _checked_call(adapt_kernel,
-                adaptation.moments, state.eta, proposal, jnp.asarray(eligible)
+                adaptation.moments, state.eta, proposal, jnp.asarray(eligible),
+                chain=chain, chain_index=chain_index, stage="adaptation", quantity="V_prop", batch=batch,
             )
             zero = jnp.all(moments.m2 == 0, axis=(-2, -1))
             adaptation = replace(
@@ -432,11 +433,12 @@ def _run_metropolis_chunk(
             )
             if completed == adaptation.num_warmup:
                 if np.any(np.asarray(zero)):
-                    raise WarmupTuningError(adaptation)
+                    raise WarmupTuningError(adaptation, chain=chain, chain_index=chain_index, batch=batch)
                 phase = "sampling"
             if step_size_adaptation is not None:
                 da_state = _checked_call(da_update,
-                    step_size_adaptation.state, jnp.mean(info.theta.acceptance_rate)
+                    step_size_adaptation.state, jnp.mean(info.theta.acceptance_rate),
+                    chain=chain, chain_index=chain_index, stage="adaptation", quantity="epsilon", batch=batch,
                 )
                 step_size_adaptation = replace(step_size_adaptation, state=da_state)
                 epsilon = float(
@@ -444,7 +446,12 @@ def _run_metropolis_chunk(
                     else jnp.exp(da_state.log_step_size)
                 )
             if is_mala:
-                _check_diffusion(epsilon, proposal)
+                try:
+                    _check_diffusion(epsilon, proposal)
+                except FloatingPointError as error:
+                    raise SamplingError(str(error), chain, chain_index=chain_index,
+                                        stage="adaptation", quantity="epsilon/diffusion", role="next", batch=batch,
+                                        attempted_tuning={"epsilon": epsilon, "V_prop": proposal}, failed_value=epsilon) from error
         candidate = replace(
             chain, model_state=state, key=next_key, V_prop=proposal,
             iteration=chain.iteration + 1, phase=phase, adaptation=adaptation,
@@ -454,9 +461,12 @@ def _run_metropolis_chunk(
                 candidate, epsilon=epsilon, step_size_adaptation=step_size_adaptation
             )
         chain = candidate
+        if diagnostic:
+            _audit_geometry(target, chain, chain_index=chain_index, batch=batch, diagnostic=diagnostic)
         samples.append(chain.model_state)
         diagnostics.append(info)
-    target.gp.validate_field_sites(target.coordinates.eta_to_theta_tilde(chain.model_state.eta))
+    if not diagnostic:
+        _audit_geometry(target, chain, chain_index=chain_index, batch=batch, diagnostic=diagnostic)
     return (
         chain,
         jax.tree.map(lambda *values: jnp.stack(values), *samples),
@@ -482,7 +492,7 @@ def run_fixed_random_walk(
     _check_chain_control(chain, RandomWalkChain)
     if chain.phase != "sampling":
         raise ValueError("Complete warmup before retained sampling")
-    return _run_metropolis_chunk(target, chain, num_sweeps)
+    return _run_metropolis_batch(target, chain, num_sweeps)
 
 
 def run_random_walk_warmup(
@@ -490,7 +500,7 @@ def run_random_walk_warmup(
     chain: RandomWalkChain,
     num_sweeps: int | None = None,
 ) -> tuple[RandomWalkChain, CalibrationState, GibbsSweepInfo]:
-    """Run a warmup chunk, optionally finishing all remaining warmup sweeps.
+    """Run a warmup batch, optionally finishing all remaining warmup sweeps.
 
     Returns warmup history separately from retained production draws. Each
     full sweep uses the previous proposal; its completed eta updates online
@@ -510,9 +520,9 @@ def run_random_walk_warmup(
         or num_sweeps < 1 or num_sweeps > remaining
     ):
         raise ValueError(
-            "Warmup chunk must be positive and not exceed remaining sweeps"
+            "Warmup batch must be positive and not exceed remaining sweeps"
         )
-    return _run_metropolis_chunk(target, chain, num_sweeps)
+    return _run_metropolis_batch(target, chain, num_sweeps)
 
 
 def validate_mala_chain(target: CalibrationTarget, chain: MALAChain) -> MALAChain:
@@ -524,10 +534,8 @@ def validate_mala_chain(target: CalibrationTarget, chain: MALAChain) -> MALAChai
 
     if not isinstance(chain, MALAChain):
         raise ValueError("chain must be a MALAChain")
-    checked = validate_random_walk_chain(target, RandomWalkChain(
-        chain.model_state, chain.key, chain.V_prop, chain.iteration,
-        chain.phase, chain.adaptation,
-    ))
+    state, proposal, adaptation = _validate_metropolis_boundary(target, chain)
+    checked = replace(chain, model_state=state, V_prop=proposal, adaptation=adaptation)
     epsilon = _validate_mala_tuning(chain.epsilon, checked.V_prop)
     step_size_adaptation = chain.step_size_adaptation
     if step_size_adaptation is not None:
@@ -588,14 +596,9 @@ def initialize_mala_warmup(
     if V_prop is None:
         n, d = state.eta.shape
         V_prop = jnp.tile(jnp.eye(d, dtype=jnp.float64), (n, 1, 1))
-    initial = initialize_random_walk_warmup(
-        target, state, key, num_warmup=num_warmup, num_initial=num_initial,
-        V_prop=V_prop,
-    )
-    chain = validate_mala_chain(target, MALAChain(
-        initial.model_state, initial.key, initial.V_prop, epsilon,
-        initial.iteration, initial.phase, initial.adaptation,
-    ))
+    initial = initialize_mala_chain(target, state, key, V_prop, epsilon)
+    adaptation = initialize_random_walk_adaptation(num_warmup, num_initial, initial.V_prop)
+    chain = validate_mala_chain(target, replace(initial, phase="warmup", adaptation=adaptation))
     if target_accept is not None:
         value = np.asarray(target_accept)
         if (
@@ -625,7 +628,7 @@ def run_fixed_mala(
     _check_chain_control(chain, MALAChain)
     if chain.phase != "sampling":
         raise ValueError("Complete warmup before retained sampling")
-    return _run_metropolis_chunk(target, chain, num_sweeps)
+    return _run_metropolis_batch(target, chain, num_sweeps)
 
 
 def run_mala_warmup(
@@ -644,9 +647,9 @@ def run_mala_warmup(
         or num_sweeps < 1 or num_sweeps > remaining
     ):
         raise ValueError(
-            "Warmup chunk must be positive and not exceed remaining sweeps"
+            "Warmup batch must be positive and not exceed remaining sweeps"
         )
-    return _run_metropolis_chunk(target, chain, num_sweeps)
+    return _run_metropolis_batch(target, chain, num_sweeps)
 
 
 @dataclass(frozen=True)
@@ -700,8 +703,7 @@ def nuts_gibbs_sweep(
 def validate_nuts_chain(target: CalibrationTarget, chain: NUTSChain) -> NUTSChain:
     """Validate model, finite gradient, tuning and standard-window phase.
 
-    Reuse existing model/PRNG/GP checks with identity site tuning; NUTS has
-    its own diagonal all-site mass and window counters. Validation does not
+    Model/PRNG/GP checks are independent of NUTS mass and window counters. Validation does not
     consume randomness, clip tuning, or retain target gradients.
     """
 
@@ -714,10 +716,9 @@ def validate_nuts_chain(target: CalibrationTarget, chain: NUTSChain) -> NUTSChai
     n, d = chain.model_state.eta.shape
     blocks = nuts_blocks(n, chain.block_size)
     blocked = len(blocks) > 1
-    identity = jnp.tile(jnp.eye(d, dtype=jnp.float64), (n, 1, 1))
-    checked = validate_random_walk_chain(target, RandomWalkChain(
-        chain.model_state, chain.key, identity, chain.iteration
-    ))
+    validate_control(chain.iteration, chain.phase)
+    validate_key(chain.key)
+    state = validate_model_state(target, chain.model_state)
     for name in ("step_size", "divergence_threshold"):
         value = np.asarray(getattr(chain, name))
         shape = (len(blocks),) if name == "step_size" and blocked else ()
@@ -764,7 +765,7 @@ def validate_nuts_chain(target: CalibrationTarget, chain: NUTSChain) -> NUTSChai
                 expected_step, expected_mass = final(window)
             if float(steps[index]) != float(expected_step) or not np.array_equal(mass, expected_mass):
                 raise ValueError("NUTS tuning disagrees with its window phase/state")
-    s = checked.model_state
+    s = state
     def density(eta):
         if chain.collapsed:
             return target.theta_only_collapsed(
@@ -785,7 +786,7 @@ def validate_nuts_chain(target: CalibrationTarget, chain: NUTSChain) -> NUTSChai
                    inverse_mass_matrix=(tuple(jnp.asarray(m, dtype=jnp.float64) for m in masses)
                                         if blocked else jnp.asarray(masses[0], dtype=jnp.float64)),
                    adaptation=adapt, block_size=int(chain.block_size) if blocked else None,
-                   iteration=checked.iteration, max_num_doublings=int(chain.max_num_doublings),
+                   iteration=int(chain.iteration), max_num_doublings=int(chain.max_num_doublings),
                    divergence_threshold=float(chain.divergence_threshold))
 
 
@@ -843,20 +844,22 @@ def initialize_nuts_warmup(
     return validate_nuts_chain(target, chain)
 
 
-def _run_nuts_chunk(target, chain, num_sweeps, *, kernels=None):
+def _run_nuts_batch(target, chain, num_sweeps, *, kernels=None, diagnostic=False, chain_index=None):
     """Keep full-sweep recording and standard adaptation on the same clock."""
 
     if kernels is None:
-        kernels = ChunkRunner(target, chain).kernels
+        kernels = SweepRunner(target, chain).kernels
     kernel = kernels["sweep"]
     blocks = nuts_blocks(chain.model_state.eta.shape[0], chain.block_size)
     blocked = len(blocks) > 1
     if chain.adaptation is not None:
         update, final, schedule = kernels["update"], kernels["final"], kernels["schedule"]
+    batch = (chain.iteration + 1, chain.iteration + num_sweeps)
     samples, diagnostics = [], []
     for _ in range(num_sweeps):
         state, key, info = _checked_call(kernel,
-            chain.key, chain.model_state, chain.step_size, chain.inverse_mass_matrix
+            chain.key, chain.model_state, chain.step_size, chain.inverse_mass_matrix,
+            chain=chain, chain_index=chain_index, target=target, diagnostic=diagnostic, batch=batch,
         )
         step, mass, adapt, phase = (
             chain.step_size, chain.inverse_mass_matrix, chain.adaptation, chain.phase
@@ -869,20 +872,31 @@ def _run_nuts_chunk(target, chain, num_sweeps, *, kernels=None):
             finals = final if blocked else (final,)
             rates = info.theta.acceptance_rate if blocked else (info.theta.acceptance_rate,)
             next_windows, next_steps, next_masses = [], [], []
-            for (start, stop), window, upd, fin, rate in zip(
+            for block, ((start, stop), window, upd, fin, rate) in enumerate(zip(
                 blocks, windows, updates, finals, rates
-            ):
+            )):
                 position = state.eta[start:stop].reshape(-1)
                 updated = _checked_call(upd, window, schedule[adapt.completed], position,
-                                        jnp.zeros(position.size, dtype=jnp.float64), rate)
+                                        jnp.zeros(position.size, dtype=jnp.float64), rate,
+                                        chain=chain, chain_index=chain_index, stage="adaptation",
+                                        quantity="step_size/mass", block=block, batch=batch)
                 if adapt.completed + 1 == adapt.num_warmup:
                     block_step, block_mass = fin(updated)
                 else:
                     block_step, block_mass = updated.step_size, updated.inverse_mass_matrix
                 if not np.isfinite(float(block_step)) or float(block_step) <= 0:
-                    raise FloatingPointError("Warmup produced invalid NUTS step/mass")
-                validate_nuts_mass(block_mass, position.size, chain.mass_structure,
-                                   (stop-start, state.eta.shape[1]))
+                    raise SamplingError("Warmup produced invalid NUTS step size", chain,
+                                        chain_index=chain_index, stage="adaptation",
+                                        quantity="step_size", role="next", block=block, batch=batch,
+                                        attempted_tuning={"step_size": block_step, "inverse_mass_matrix": block_mass})
+                try:
+                    validate_nuts_mass(block_mass, position.size, chain.mass_structure,
+                                       (stop-start, state.eta.shape[1]))
+                except ValueError as error:
+                    raise SamplingError(str(error), chain, chain_index=chain_index,
+                                        stage="adaptation", quantity="inverse_mass_matrix",
+                                        role="next", block=block, batch=batch,
+                                        attempted_tuning={"step_size": block_step, "inverse_mass_matrix": block_mass}) from error
                 next_windows.append(updated)
                 next_steps.append(block_step)
                 next_masses.append(block_mass)
@@ -895,9 +909,12 @@ def _run_nuts_chunk(target, chain, num_sweeps, *, kernels=None):
         chain = replace(chain, model_state=state, key=key, step_size=step,
                         inverse_mass_matrix=mass, adaptation=adapt, phase=phase,
                         iteration=chain.iteration + 1)
+        if diagnostic:
+            _audit_geometry(target, chain, chain_index=chain_index, batch=batch, diagnostic=diagnostic)
         samples.append(chain.model_state)
         diagnostics.append(info)
-    target.gp.validate_field_sites(target.coordinates.eta_to_theta_tilde(chain.model_state.eta))
+    if not diagnostic:
+        _audit_geometry(target, chain, chain_index=chain_index, batch=batch, diagnostic=diagnostic)
     return (chain, jax.tree.map(lambda *x: jnp.stack(x), *samples),
             jax.tree.map(lambda *x: jnp.stack(x), *diagnostics))
 
@@ -905,7 +922,7 @@ def _run_nuts_chunk(target, chain, num_sweeps, *, kernels=None):
 def run_nuts_warmup(
     target: CalibrationTarget, chain: NUTSChain, num_sweeps: int | None = None,
 ) -> tuple[NUTSChain, CalibrationState, GibbsSweepInfo]:
-    """Run a warmup-only chunk; freeze final average step size and mass."""
+    """Run a warmup-only batch; freeze final average step size and mass."""
 
     _check_chain_control(chain, NUTSChain)
     if chain.phase != "warmup":
@@ -915,8 +932,8 @@ def run_nuts_warmup(
         num_sweeps = remaining
     if (isinstance(num_sweeps, bool) or not isinstance(num_sweeps, Integral)
         or not 1 <= num_sweeps <= remaining):
-        raise ValueError("NUTS warmup chunk must fit remaining schedule")
-    return _run_nuts_chunk(target, chain, num_sweeps)
+        raise ValueError("NUTS warmup batch must fit remaining schedule")
+    return _run_nuts_batch(target, chain, num_sweeps)
 
 
 def run_fixed_nuts(
@@ -930,7 +947,7 @@ def run_fixed_nuts(
     if (isinstance(num_sweeps, bool) or not isinstance(num_sweeps, Integral)
         or num_sweeps < 1):
         raise ValueError("num_sweeps must be a positive integer")
-    return _run_nuts_chunk(target, chain, num_sweeps)
+    return _run_nuts_batch(target, chain, num_sweeps)
 
 
 @dataclass(frozen=True)
@@ -974,11 +991,10 @@ def validate_mmala_chain(target: CalibrationTarget, chain: MMALAChain) -> MMALAC
     if not isinstance(chain.model_state, CalibrationState):
         raise ValueError("model_state must be a CalibrationState")
     n, d = chain.model_state.eta.shape
-    identity = jnp.tile(jnp.eye(d, dtype=jnp.float64), (n, 1, 1))
-    checked = validate_random_walk_chain(target, RandomWalkChain(
-        chain.model_state, chain.key, identity, chain.iteration
-    ))
-    s = checked.model_state
+    validate_control(chain.iteration, chain.phase)
+    validate_key(chain.key)
+    state = validate_model_state(target, chain.model_state)
+    s = state
     epsilon, ridge = validate_mmala_geometry(
         target, s.eta, s.delta, s.sigma_y2, s.mu_theta, s.Sigma_theta,
         s.sigma_c2, chain.epsilon, chain.epsilon_G,
@@ -1012,7 +1028,7 @@ def validate_mmala_chain(target: CalibrationTarget, chain: MMALAChain) -> MMALAC
     if adapt is not None:
         adapt = replace(adapt, num_warmup=int(adapt.num_warmup))
     return replace(chain, model_state=s, epsilon=epsilon, epsilon_G=ridge,
-                   iteration=checked.iteration, adaptation=adapt)
+                   iteration=int(chain.iteration), adaptation=adapt)
 
 
 def initialize_mmala_chain(
@@ -1048,34 +1064,45 @@ def initialize_mmala_warmup(
     return validate_mmala_chain(target, replace(chain, phase="warmup", adaptation=adaptation))
 
 
-def _run_mmala_chunk(target, chain, num_sweeps, *, kernels=None):
+def _run_mmala_batch(target, chain, num_sweeps, *, kernels=None, diagnostic=False, chain_index=None):
     """Record complete sweeps and adapt epsilon once on the outer clock."""
 
     if kernels is None:
-        kernels = ChunkRunner(target, chain).kernels
+        kernels = SweepRunner(target, chain).kernels
     kernel = kernels["sweep"]
     if chain.adaptation is not None:
         update, final = kernels["update"], kernels["final"]
+    batch = (chain.iteration + 1, chain.iteration + num_sweeps)
     samples, diagnostics = [], []
     for _ in range(num_sweeps):
-        state, key, info = _checked_call(kernel, chain.key, chain.model_state, chain.epsilon)
+        state, key, info = _checked_call(kernel, chain.key, chain.model_state, chain.epsilon,
+                                        chain=chain, chain_index=chain_index, target=target, diagnostic=diagnostic, batch=batch)
         epsilon, adapt, phase = chain.epsilon, chain.adaptation, chain.phase
         if phase == "warmup":
-            da = _checked_call(update, adapt.step_size.state, jnp.mean(info.theta.acceptance_rate))
+            da = _checked_call(update, adapt.step_size.state, jnp.mean(info.theta.acceptance_rate),
+                               chain=chain, chain_index=chain_index, stage="adaptation", quantity="epsilon", batch=batch)
             adapt = replace(adapt, step_size=replace(adapt.step_size, state=da))
             if adapt.completed == adapt.num_warmup:
                 phase = "sampling"
                 epsilon = float(final(da))
             else:
                 epsilon = float(jnp.exp(da.log_step_size))
-            _check_diffusion(epsilon)
+            try:
+                _check_diffusion(epsilon)
+            except FloatingPointError as error:
+                raise SamplingError(str(error), chain, chain_index=chain_index,
+                                    stage="adaptation", quantity="epsilon/diffusion", role="next", batch=batch,
+                                    attempted_tuning={"epsilon": epsilon}, failed_value=epsilon) from error
         chain = replace(
             chain, model_state=state, key=key, epsilon=epsilon, adaptation=adapt,
             phase=phase, iteration=chain.iteration + 1,
         )
+        if diagnostic:
+            _audit_geometry(target, chain, chain_index=chain_index, batch=batch, diagnostic=diagnostic)
         samples.append(chain.model_state)
         diagnostics.append(info)
-    target.gp.validate_field_sites(target.coordinates.eta_to_theta_tilde(chain.model_state.eta))
+    if not diagnostic:
+        _audit_geometry(target, chain, chain_index=chain_index, batch=batch, diagnostic=diagnostic)
     return (chain, jax.tree.map(lambda *x: jnp.stack(x), *samples),
             jax.tree.map(lambda *x: jnp.stack(x), *diagnostics))
 
@@ -1083,7 +1110,7 @@ def _run_mmala_chunk(target, chain, num_sweeps, *, kernels=None):
 def run_mmala_warmup(
     target: CalibrationTarget, chain: MMALAChain, num_sweeps: int | None = None,
 ) -> tuple[MMALAChain, CalibrationState, GibbsSweepInfo]:
-    """Run a warmup-only chunk, freezing final averaged epsilon at its end."""
+    """Run a warmup-only batch, freezing final averaged epsilon at its end."""
 
     _check_chain_control(chain, MMALAChain)
     if chain.phase != "warmup":
@@ -1093,8 +1120,8 @@ def run_mmala_warmup(
         num_sweeps = remaining
     if (isinstance(num_sweeps, bool) or not isinstance(num_sweeps, Integral)
         or not 1 <= num_sweeps <= remaining):
-        raise ValueError("MMALA warmup chunk must fit remaining schedule")
-    return _run_mmala_chunk(target, chain, num_sweeps)
+        raise ValueError("MMALA warmup batch must fit remaining schedule")
+    return _run_mmala_batch(target, chain, num_sweeps)
 
 
 def run_fixed_mmala(
@@ -1108,16 +1135,16 @@ def run_fixed_mmala(
     if (isinstance(num_sweeps, bool) or not isinstance(num_sweeps, Integral)
         or num_sweeps < 1):
         raise ValueError("num_sweeps must be a positive integer")
-    return _run_mmala_chunk(target, chain, num_sweeps)
+    return _run_mmala_batch(target, chain, num_sweeps)
 
 
-class ChunkRunner:
-    """Reuse JAX functions across checkpoint chunks for one fixed target/config.
+class SweepRunner:
+    """Reuse numerical sweep functions for one fixed target and sampler.
 
-    The public one-shot drivers remain available. This orchestration object
-    shares their exact transitions and checks, avoiding repeated tracing of
-    fresh closures during timed runs. It holds compiled functions, not model
-    states or density/gradient caches. Build a new runner after restart.
+    Holds compiled functions, separate from model/adaptation/diagnostics.
+    Local batches never mix warmup with retained sampling. Normal execution
+    audits GP geometry once at each batch endpoint; diagnostic execution
+    applies the same criterion to every completed state. No I/O or job state.
     """
 
     @staticmethod
@@ -1136,13 +1163,16 @@ class ChunkRunner:
             getattr(chain, "mass_structure", None), getattr(chain, "block_size", None),
         )
 
-    def __init__(self, target, chain):
+    def __init__(self, target, chain, *, diagnostic=False):
+        if not isinstance(diagnostic, bool):
+            raise ValueError("diagnostic must be a boolean")
+        self.diagnostic = diagnostic
         self.target = target
         self.settings = self._settings(chain)
         self.kernels = {}
         adapt = chain.adaptation
         if isinstance(chain, NUTSChain):
-            self.run = _run_nuts_chunk
+            self.run = _run_nuts_batch
             self.kernels["sweep"] = jax.jit(lambda key, state, step, mass:
                 nuts_gibbs_sweep(
                     key, target, state, step, mass,
@@ -1161,7 +1191,7 @@ class ChunkRunner:
                                     final=finals if len(blocks)>1 else finals[0],
                                     schedule=build_schedule(adapt.num_warmup))
         elif isinstance(chain, MMALAChain):
-            self.run = _run_mmala_chunk
+            self.run = _run_mmala_batch
             self.kernels["sweep"] = jax.jit(lambda key, state, epsilon:
                 mmala_gibbs_sweep(key, target, state, epsilon, chain.epsilon_G))
             if adapt is not None:
@@ -1169,7 +1199,7 @@ class ChunkRunner:
                 self.kernels.update(update=jax.jit(update), final=final)
         elif isinstance(chain, (RandomWalkChain, MALAChain)):
             is_mala = isinstance(chain, MALAChain)
-            self.run = _run_metropolis_chunk
+            self.run = _run_metropolis_batch
             self.kernels["sweep"] = jax.jit(lambda key, state, proposal, epsilon:
                 collapsed_gibbs_sweep(key, target, state, proposal, epsilon=epsilon))
             self.kernels["moments"] = jax.jit(lambda moments, eta, proposal, eligible:
@@ -1187,14 +1217,15 @@ class ChunkRunner:
         for name in ("moments", "update"):
             if name in self.kernels:
                 value = self.kernels[name]
-                self.kernels[name] = (tuple(_checked_adaptation(fn) for fn in value)
-                                      if isinstance(value, tuple) else _checked_adaptation(value))
+                self.kernels[name] = (tuple(_checked_adaptation(fn, "window") for fn in value)
+                                      if isinstance(value, tuple) else _checked_adaptation(
+                                          value, "covariance" if name == "moments" else "step_size"))
 
     def compile(self, chain):
         """Compile the sweep without consuming keys; adaptation compiles in warmup."""
         _check_chain_control(chain, self.settings[0])
         if self._settings(chain) != self.settings:
-            raise ValueError("ChunkRunner configuration changed")
+            raise ValueError("SweepRunner configuration changed")
         args = (chain.key, chain.model_state)
         if isinstance(chain, NUTSChain):
             args += (chain.step_size, chain.inverse_mass_matrix)
@@ -1204,15 +1235,16 @@ class ChunkRunner:
             args += (chain.V_prop, getattr(chain, "epsilon", None))
         self.kernels["sweep"].lower(*args).compile()
 
-    def __call__(self, chain, num_sweeps):
+    def __call__(self, chain, num_sweeps, *, chain_index=None):
         _check_chain_control(chain, self.settings[0])
         if self._settings(chain) != self.settings:
-            raise ValueError("ChunkRunner configuration changed")
+            raise ValueError("SweepRunner configuration changed")
         if (isinstance(num_sweeps, bool) or not isinstance(num_sweeps, Integral)
             or num_sweeps < 1):
             raise ValueError("num_sweeps must be a positive integer")
         if chain.phase == "warmup" and num_sweeps > (
             chain.adaptation.num_warmup - chain.adaptation.completed
         ):
-            raise ValueError("A chunk cannot mix warmup and production")
-        return self.run(self.target, chain, num_sweeps, kernels=self.kernels)
+            raise ValueError("A batch cannot mix warmup and production")
+        return self.run(self.target, chain, num_sweeps, kernels=self.kernels,
+                        diagnostic=self.diagnostic, chain_index=chain_index)

@@ -1,10 +1,7 @@
-"""MMALA Gibbs order, standard epsilon DA, frozen production and restart."""
+"""MMALA Gibbs order, standard epsilon DA, frozen production and batches."""
 
-import json
-import tempfile
 import unittest
 from dataclasses import replace
-from pathlib import Path
 
 import jax
 
@@ -22,7 +19,6 @@ from bayesiancalibration.mcmc import (
     mmala_gibbs_sweep, initialize_mmala_warmup, initialize_mmala_chain,
     run_mmala_warmup, run_fixed_mmala, validate_mmala_chain,
 )
-from bayesiancalibration.run import save_checkpoint, load_checkpoint
 from bayesiancalibration.samplers.mmala import update_collapsed_mmala, collapsed_mmala_metric
 import test_mcmc as reference
 
@@ -63,7 +59,7 @@ class MMALAIntegrationTest(unittest.TestCase):
                 self.assertFalse(np.array_equal(repeated.c_f, s.c_f))
                 np.testing.assert_array_equal(rejected.theta.is_accepted, [False, False])
 
-    def test_dynamic_epsilon_matches_standard_da_and_restart_is_bitwise(self):
+    def test_dynamic_epsilon_matches_standard_da_and_batches(self):
         for bounded, loading, key in ((False, False, jax.random.key(1321)),
                                      (True, True, jax.random.PRNGKey(1322))):
             target, s, _ = reference.make_fixture(bounded, loading)
@@ -102,30 +98,27 @@ class MMALAIntegrationTest(unittest.TestCase):
             )
             self.assertFalse(np.allclose(first_metric, last_metric))
             part, _, _ = run_mmala_warmup(target, initial, 2)
-            with tempfile.TemporaryDirectory() as directory:
-                path = Path(directory)/'mmala.npz'
-                for boundary in (initial, part, full):
-                    save_checkpoint(path, target, boundary)
-                    restored, metadata = load_checkpoint(path, target)
-                    self.assertEqual(metadata['sampler'], 'collapsed_mmala')
-                    self.assertEqual(restored.key.dtype, boundary.key.dtype)
-                    self.assertEqual(restored.epsilon_G, .07)
-                    if restored.phase == 'warmup':
-                        restored, samples, diagnostics = run_mmala_warmup(target, restored)
-                        offset = boundary.iteration
-                        self.assert_tree_equal(
-                            samples, jax.tree.map(lambda x: x[offset:], all_samples), True
-                        )
-                        self.assert_tree_equal(
-                            diagnostics, jax.tree.map(lambda x: x[offset:], all_info), True
-                        )
-                    completed, more, more_info = run_fixed_mmala(target, restored, 2)
-                    self.assert_tree_equal(more, expected, True)
-                    self.assert_tree_equal(more_info, info, True)
-                    self.assert_tree_equal(completed.model_state, production.model_state, True)
-                    np.testing.assert_array_equal(jax.random.key_data(completed.key),
-                                                  jax.random.key_data(production.key))
-                    self.assertEqual(completed.iteration, 7)
+            for boundary in (initial, part, full):
+                self.assertEqual(boundary.key.dtype, initial.key.dtype)
+                self.assertEqual(boundary.epsilon_G, .07)
+                if boundary.phase == 'warmup':
+                    finished, samples, diagnostics = run_mmala_warmup(target, boundary)
+                    offset = boundary.iteration
+                    self.assert_tree_equal(
+                        samples, jax.tree.map(lambda x: x[offset:], all_samples), True
+                    )
+                    self.assert_tree_equal(
+                        diagnostics, jax.tree.map(lambda x: x[offset:], all_info), True
+                    )
+                else:
+                    finished = boundary
+                completed, more, more_info = run_fixed_mmala(target, finished, 2)
+                self.assert_tree_equal(more, expected, True)
+                self.assert_tree_equal(more_info, info, True)
+                self.assert_tree_equal(completed.model_state, production.model_state, True)
+                np.testing.assert_array_equal(jax.random.key_data(completed.key),
+                                              jax.random.key_data(production.key))
+                self.assertEqual(completed.iteration, 7)
 
     def test_short_warmup_boundary_and_invalid_configuration(self):
         target, s, _ = reference.make_fixture()
@@ -156,34 +149,14 @@ class MMALAIntegrationTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 run(target, *args)
 
-    def test_checkpoint_ridge_and_incompatible_schedule_are_rejected(self):
+    def test_fixed_tuning_initialization(self):
         target, s, _ = reference.make_fixture()
-        chain = initialize_mmala_warmup(
-            target, s, jax.random.key(1324), num_warmup=3, epsilon=.4, epsilon_G=.08
+        fixed = initialize_mmala_chain(
+            target, s, jax.random.key(1324), epsilon=.4, epsilon_G=.08
         )
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory)/'mmala.npz'
-            save_checkpoint(path, target, chain)
-            with np.load(path, allow_pickle=False) as archive:
-                payload = {name: archive[name] for name in archive.files}
-            np.savez_compressed(path, **dict(payload, **{'sampler.epsilon_G': np.asarray(.1)}))
-            with self.assertRaisesRegex(ValueError, 'checksum'):
-                load_checkpoint(path, target)
-            for field, value in (('sampler', 'collapsed_mala'), ('adaptation', None),
-                                 ('step_size_adaptation', None)):
-                metadata = json.loads(str(payload['metadata'].item()))
-                metadata[field] = value
-                np.savez_compressed(path, **dict(
-                    payload, metadata=np.asarray(json.dumps(metadata))
-                ))
-                with self.assertRaises(ValueError):
-                    load_checkpoint(path, target)
-            fixed = initialize_mmala_chain(target, s, chain.key, epsilon=.4, epsilon_G=.08)
-            save_checkpoint(path, target, fixed)
-            restored, _ = load_checkpoint(path, target)
-            self.assertIsNone(restored.adaptation)
-            self.assertEqual(restored.epsilon, .4)
-            self.assertEqual(restored.epsilon_G, .08)
+        self.assertIsNone(fixed.adaptation)
+        self.assertEqual(fixed.epsilon, .4)
+        self.assertEqual(fixed.epsilon_G, .08)
 
 
 if __name__ == '__main__':

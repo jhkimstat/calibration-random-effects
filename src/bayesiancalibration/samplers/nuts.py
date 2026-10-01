@@ -8,7 +8,7 @@ import jax
 import jax.numpy as jnp
 from blackjax.mcmc import nuts
 from jax import Array
-from jax.experimental import checkify
+from bayesiancalibration.validation import check_quantity
 
 from bayesiancalibration.state import CalibrationState
 from bayesiancalibration.targets import CalibrationTarget
@@ -37,7 +37,7 @@ class NUTSSweepInfo(NamedTuple):
 def nuts_blocks(n: int, block_size: int | None) -> tuple[tuple[int, int], ...]:
     """Static contiguous site slices, including a smaller final block.
 
-    A shared helper keeps kernel, tuning and checkpoint block layouts identical.
+    A shared helper keeps kernel, tuning and adaptation block layouts identical.
     None selects the original all-site transition.
     """
     if block_size is None:
@@ -71,7 +71,7 @@ def nuts_sweep(
         return _nuts_transition(
             key, target, state, step_size, inverse_mass_matrix,
             max_num_doublings=max_num_doublings,
-            divergence_threshold=divergence_threshold, collapsed=collapsed,
+            divergence_threshold=divergence_threshold, collapsed=collapsed, block_index=0,
         )
     eta, diagnostics = state.eta, []
     for index, ((start, stop), block_key) in enumerate(zip(
@@ -81,7 +81,7 @@ def nuts_sweep(
             block_key, target, state._replace(eta=eta), step_size[index],
             inverse_mass_matrix[index], site_slice=(start, stop),
             max_num_doublings=max_num_doublings,
-            divergence_threshold=divergence_threshold, collapsed=collapsed,
+            divergence_threshold=divergence_threshold, collapsed=collapsed, block_index=index,
         )
         diagnostics.append(info)
     values = []
@@ -99,7 +99,7 @@ def _nuts_transition(
     key: Array, target: CalibrationTarget, state: CalibrationState,
     step_size: Array, inverse_mass_matrix: Array,
     *, max_num_doublings: int = 10, divergence_threshold: float = 1000,
-    collapsed: bool = False, site_slice: tuple[int, int] | None = None,
+    collapsed: bool = False, site_slice: tuple[int, int] | None = None, block_index: int = 0,
 ) -> tuple[Array, NUTSSweepInfo]:
     """One all-site transition; collapsed selects the integrated c_f target.
 
@@ -130,16 +130,18 @@ def _nuts_transition(
 
     position = state.eta if site_slice is None else state.eta[site_slice[0]:site_slice[1]]
     initial = nuts.init(position.reshape(-1), density)
-    checkify.debug_check(
+    check_quantity(
         jnp.isfinite(initial.logdensity) & jnp.all(jnp.isfinite(initial.logdensity_grad)),
-        "NUTS current density/gradient is nonfinite",
+        update="eta", quantity="density_gradient", role="current", block=block_index,
+        description="NUTS current density/gradient is nonfinite",
     )
     updated, info = nuts.build_kernel(divergence_threshold=divergence_threshold)(
         key, initial, density, step_size, inverse_mass_matrix, max_num_doublings
     )
-    checkify.debug_check(
+    check_quantity(
         jnp.isfinite(updated.logdensity) & jnp.all(jnp.isfinite(updated.logdensity_grad)),
-        "NUTS selected density/gradient is nonfinite",
+        update="eta", quantity="density_gradient", role="selected", block=block_index,
+        description="NUTS selected density/gradient is nonfinite",
     )
     return embed(updated.position), NUTSSweepInfo(
         info.acceptance_rate, updated.logdensity, info.is_divergent,

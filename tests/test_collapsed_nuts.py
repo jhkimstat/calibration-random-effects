@@ -13,7 +13,7 @@ import test_mcmc as outer_reference
 
 
 class CollapsedNUTSTest(reference.NUTSTest):
-    """Apply the same kernel/schedule/posterior/restart gates to Stage 12."""
+    """Apply the same kernel/schedule/posterior/batching gates to Stage 12."""
 
     collapsed = True
 

@@ -1,8 +1,5 @@
-"""Sequential conditional NUTS references, ragged blocks and exact restart."""
+"""Sequential conditional NUTS references, ragged blocks and numerical batches."""
 from dataclasses import replace
-import json
-from pathlib import Path
-import tempfile
 import unittest
 
 import jax
@@ -12,9 +9,8 @@ import numpy as np
 from blackjax.mcmc import nuts
 from blackjax.adaptation.staged_adaptation import build_schedule
 
-from bayesiancalibration import comparison, mcmc
+from bayesiancalibration import mcmc
 from bayesiancalibration.adaptation import nuts_window_adapter
-from bayesiancalibration.run import save_checkpoint, load_checkpoint, _array_digest
 from bayesiancalibration.samplers.nuts import nuts_sweep, nuts_blocks
 from bayesiancalibration.targets import CalibrationTarget
 import test_mcmc as reference
@@ -108,8 +104,8 @@ class BlockNUTSTest(unittest.TestCase):
             b = mcmc.initialize_nuts_warmup(target, state, key, num_warmup=3,
                     initial_step_size=.02, max_num_doublings=2, mass_structure=structure, block_size=3)
             self.assertIsNone(b.block_size)
-            out_a, sa, da = mcmc.ChunkRunner(target, a)(a, 2)
-            out_b, sb, db = mcmc.ChunkRunner(target, b)(b, 2)
+            out_a, sa, da = mcmc.SweepRunner(target, a)(a, 2)
+            out_b, sb, db = mcmc.SweepRunner(target, b)(b, 2)
             self.equal((sa, da, out_a.key), (sb, db, out_b.key), exact=True)
         self.assertEqual(nuts_blocks(60, 12), tuple((i, i+12) for i in range(0, 60, 12)))
         self.assertEqual(nuts_blocks(5, 2), ((0, 2), (2, 4), (4, 5)))
@@ -117,7 +113,7 @@ class BlockNUTSTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 mcmc.initialize_nuts_warmup(target, state, key, block_size=bad)
 
-    def test_adaptation_restart_freeze_and_ragged_draw_files(self):
+    def test_adaptation_batches_freeze_and_ragged_diagnostics(self):
         for collapsed in (False, True):
             for structure in ('diagonal', 'kronecker', 'dense'):
                 with self.subTest(collapsed=collapsed, mass=structure):
@@ -127,76 +123,66 @@ class BlockNUTSTest(unittest.TestCase):
                         target, state, key, num_warmup=6, initial_step_size=.015,
                         max_num_doublings=2, mass_structure=structure,
                         collapsed=collapsed, block_size=2)
-                    runner = mcmc.ChunkRunner(target, initial)
-                    first, _, _ = runner(initial, 2)
+                    runner = mcmc.SweepRunner(target, initial)
+                    first, first_samples, first_diag = runner(initial, 2)
                     last, samples, diag = runner(first, 4)
                     self.assertEqual(last.phase, 'sampling')
-                    for i, ((start, stop), window) in enumerate(zip(((0,2),(2,3)), first.adaptation.state)):
-                        # Separate BlackJAX engines driven by each block's own accepted position/rate.
+                    full, all_samples, all_diag = mcmc.run_nuts_warmup(target, initial)
+                    self.equal((last.key, last.step_size, last.inverse_mass_matrix, last.adaptation.state),
+                               (full.key, full.step_size, full.inverse_mass_matrix, full.adaptation.state),
+                               exact=True)
+                    self.assertEqual(last.adaptation.completed, full.adaptation.completed)
+                    self.equal(jax.tree.map(lambda a, b: jnp.concatenate((a, b)),
+                                            first_samples, samples), all_samples, exact=True)
+                    self.equal(jax.tree.map(lambda a, b: jnp.concatenate((a, b)),
+                                            first_diag, diag), all_diag, exact=True)
+                    for i, ((start, stop), window) in enumerate(zip(((0, 2), (2, 3)), first.adaptation.state)):
+                        # Each block's BlackJAX engine uses its own selected position/rate.
                         init, update, _ = nuts_window_adapter(.8, structure, (stop-start, 2))
                         expected = init(state.eta[start:stop].reshape(-1), .015)
-                        _, first_samples, first_diag = runner(initial, 2)
                         for j in range(2):
-                            position = first_samples.eta[j,start:stop].reshape(-1)
+                            position = first_samples.eta[j, start:stop].reshape(-1)
                             expected = jax.jit(update)(expected, build_schedule(6)[j],
-                                position, jnp.zeros(position.size), first_diag.theta.acceptance_rate[j,i])
+                                position, jnp.zeros(position.size), first_diag.theta.acceptance_rate[j, i])
                         self.equal(window, expected)
-                    with tempfile.TemporaryDirectory() as temp:
-                        path = Path(temp)/'checkpoint.npz'
-                        for boundary, count in ((initial,6), (first,4), (last,2)):
-                            save_checkpoint(path, target, boundary)
-                            loaded, metadata = load_checkpoint(path, target)
-                            self.assertEqual(metadata['nuts']['block_size'], 2)
-                            expected, es, ed = runner(boundary, count)
-                            actual, rs, rd = mcmc.ChunkRunner(target, loaded)(loaded, count)
-                            self.equal((es,ed,expected.key,expected.step_size,expected.inverse_mass_matrix),
-                                       (rs,rd,actual.key,actual.step_size,actual.inverse_mass_matrix),exact=True)
-                        retained, _, _ = runner(last, 2)
-                        self.equal((retained.step_size,retained.inverse_mass_matrix,retained.adaptation.state),
-                                   (last.step_size,last.inverse_mass_matrix,last.adaptation.state),exact=True)
-                        # Metadata corruption must be rejected even with intact array checksums.
-                        with np.load(path, allow_pickle=False) as a: payload = dict(a)
-                        meta = json.loads(str(payload['metadata'].item()))
-                        meta['nuts']['block_size'] = 1
-                        payload['metadata'] = np.asarray(json.dumps(meta))
-                        np.savez(path, **payload)
-                        with self.assertRaises(ValueError): load_checkpoint(path, target)
-                    # Configuration cannot change underneath an existing compiled runner.
-                    with self.assertRaises(ValueError): runner(replace(first, block_size=1), 1)
+                    retained, _, _ = runner(last, 2)
+                    self.equal((retained.step_size, retained.inverse_mass_matrix, retained.adaptation.state),
+                               (last.step_size, last.inverse_mass_matrix, last.adaptation.state), exact=True)
+                    self.assertEqual(diag.theta.acceptance_rate.shape, (4, 2))
+                    mass_shapes = ((4,), (2,)) if structure == 'diagonal' else ((4, 4), (2, 2))
+                    for mass, shape in zip(diag.theta.inverse_mass_matrix, mass_shapes):
+                        self.assertEqual(mass.shape, (4, *shape))
+                    # A compiled runner's static block configuration cannot change mid-run.
+                    with self.assertRaises(ValueError):
+                        runner(replace(first, block_size=1), 1)
 
-    def test_outer_gibbs_schedule_and_comparison_serialization(self):
+    def test_outer_gibbs_schedule_and_ragged_batch_shapes(self):
         target, state = fixture()
-        config = json.loads(Path('experiments/comparison.json').read_text())
-        config.update(nuts_block_size=2, nuts_mass_structure='kronecker', num_warmup=6,
-                      num_initial=2, chunk_sweeps=2, nuts_initial_step_size=.02, max_num_doublings=2)
         for collapsed in (False, True):
-            method = 'collapsed_nuts' if collapsed else 'nuts'
-            chain = comparison.initialize_chain(target,state,config,method,0)
-            # Existing outer schedule is independently exercised with a reference theta hook.
+            chain = mcmc.initialize_nuts_warmup(
+                target, state, jax.random.key(785), num_warmup=6,
+                initial_step_size=.02, max_num_doublings=3,
+                mass_structure='kronecker', block_size=2, collapsed=collapsed)
+            # An explicit reference theta hook exercises current outer-Gibbs conditioning.
             def hook(key, conditioned):
-                eta, _ = sequential_reference(key,target,conditioned,chain.step_size,
-                                               chain.inverse_mass_matrix,collapsed)
-                # Keep the public info fields; the complete resulting model checks the schedule.
-                _, info = nuts_sweep(key,target,conditioned,chain.step_size,chain.inverse_mass_matrix,
-                                     block_size=2,collapsed=collapsed,max_num_doublings=3)
+                eta, _ = sequential_reference(key, target, conditioned, chain.step_size,
+                                               chain.inverse_mass_matrix, collapsed)
+                _, info = nuts_sweep(key, target, conditioned, chain.step_size,
+                                     chain.inverse_mass_matrix, block_size=2,
+                                     collapsed=collapsed, max_num_doublings=3)
                 return eta, info
             expected = jax.jit(lambda k, st: mcmc.collapsed_gibbs_sweep(
-                k,target,st,None,_theta_transition=hook))(chain.key,state)
+                k, target, st, None, _theta_transition=hook))(chain.key, state)
             actual = jax.jit(lambda k, st: mcmc.nuts_gibbs_sweep(
-                k,target,st,chain.step_size,chain.inverse_mass_matrix,
-                block_size=2,collapsed=collapsed,max_num_doublings=3))(chain.key,state)
-            self.equal(actual,expected)
-            with tempfile.TemporaryDirectory() as temp:
-                result = comparison.run_chain(target,chain,Path(temp),config,{'test':'blocks'},
-                                               source_paths={},check_sweeps=2)
-                self.assertEqual(result['iteration'],2)
-                with np.load(next(Path(temp).glob('draws-*.npz')),allow_pickle=False) as a:
-                    self.assertEqual(a['theta.acceptance_rate'].shape,(2,2))
-                    self.assertEqual(a['theta.inverse_mass_matrix.block_0'].shape,(2,4,4))
-                    self.assertEqual(a['theta.inverse_mass_matrix.block_1'].shape,(2,2,2))
-                    self.assertNotIn('theta.inverse_mass_matrix',a.files)
-        for value in (0, True, -1, 1.2):
-            with self.assertRaises(ValueError): comparison.validate_config(dict(config,nuts_block_size=value))
+                k, target, st, chain.step_size, chain.inverse_mass_matrix,
+                block_size=2, collapsed=collapsed, max_num_doublings=3))(chain.key, state)
+            self.equal(actual, expected)
+            final, samples, info = mcmc.SweepRunner(target, chain)(chain, 2)
+            self.assertEqual(final.iteration, 2)
+            self.assertEqual(samples.eta.shape, (2, 3, 2))
+            self.assertEqual(info.theta.acceptance_rate.shape, (2, 2))
+            self.assertEqual(info.theta.inverse_mass_matrix[0].shape, (2, 4, 4))
+            self.assertEqual(info.theta.inverse_mass_matrix[1].shape, (2, 2, 2))
 
 
 if __name__ == '__main__':

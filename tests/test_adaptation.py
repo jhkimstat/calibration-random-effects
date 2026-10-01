@@ -1,10 +1,7 @@
-"""Independent covariance references, warmup boundaries, and restart checks."""
+"""Independent covariance references, warmup boundaries, and numerical batches."""
 
-import json
-import tempfile
 import unittest
 from dataclasses import replace
-from pathlib import Path
 
 import jax
 
@@ -25,7 +22,6 @@ from bayesiancalibration.mcmc import (
     run_random_walk_warmup,
     validate_random_walk_chain,
 )
-from bayesiancalibration.run import load_checkpoint, save_checkpoint
 import test_mcmc as reference
 
 
@@ -214,7 +210,7 @@ class WarmupIntegrationTest(unittest.TestCase):
         self.assertEqual(chain.iteration, 0)
         self.assertEqual(chain.adaptation.completed, 0)
 
-    def test_warmup_checkpoint_restart_matches_full_run_through_production(self):
+    def test_warmup_batches_match_one_run_through_production(self):
         for bounded, loading_only, key in (
             (False, False, jax.random.key(964)),
             (True, True, jax.random.PRNGKey(965)),
@@ -223,64 +219,28 @@ class WarmupIntegrationTest(unittest.TestCase):
             chain = initialize_random_walk_warmup(
                 target, state, key, num_warmup=5, num_initial=2, V_prop=initial
             )
-            complete, warmup_samples, warmup_info = run_random_walk_warmup(
-                target, chain
-            )
-            all_final, all_samples, all_info = run_fixed_random_walk(
-                target, complete, 2
-            )
+            complete, warmup_samples, warmup_info = run_random_walk_warmup(target, chain)
+            all_final, all_samples, all_info = run_fixed_random_walk(target, complete, 2)
             part, early_samples, early_info = run_random_walk_warmup(target, chain, 3)
-            with tempfile.TemporaryDirectory() as directory:
-                path = Path(directory) / "warmup.npz"
-                save_checkpoint(path, target, part)
-                restored, metadata = load_checkpoint(path, target)
-                self.assertEqual(metadata["schema_version"], 4)
-                self.assertEqual(restored.phase, "warmup")
-                self.assertEqual(restored.adaptation.completed, 3)
-                self.assert_tree_equal(restored.adaptation.moments,
-                                       part.adaptation.moments, True)
-                late, late_samples, late_info = run_random_walk_warmup(target, restored)
-                self.assert_tree_equal(
-                    jax.tree.map(lambda a, b: jnp.concatenate((a, b)),
-                                 early_samples, late_samples), warmup_samples, True,
-                )
-                self.assert_tree_equal(
-                    jax.tree.map(lambda a, b: jnp.concatenate((a, b)),
-                                 early_info, late_info), warmup_info, True,
-                )
-                np.testing.assert_array_equal(late.V_prop, complete.V_prop)
-                # Save at the phase boundary too: frozen accumulators persist.
-                save_checkpoint(path, target, late)
-                frozen, _ = load_checkpoint(path, target)
-                final, samples, info = run_fixed_random_walk(target, frozen, 2)
-                self.assert_tree_equal(samples, all_samples, True)
-                self.assert_tree_equal(info, all_info, True)
-                self.assert_tree_equal(final.model_state, all_final.model_state, True)
-                np.testing.assert_array_equal(jax.random.key_data(final.key),
-                                              jax.random.key_data(all_final.key))
-                self.assertEqual(final.iteration, 7)
+            self.assertEqual(part.phase, "warmup")
+            self.assertEqual(part.adaptation.completed, 3)
+            late, late_samples, late_info = run_random_walk_warmup(target, part)
+            self.assert_tree_equal(jax.tree.map(
+                lambda a, b: jnp.concatenate((a, b)), early_samples, late_samples
+            ), warmup_samples, True)
+            self.assert_tree_equal(jax.tree.map(
+                lambda a, b: jnp.concatenate((a, b)), early_info, late_info
+            ), warmup_info, True)
+            np.testing.assert_array_equal(late.V_prop, complete.V_prop)
+            self.assert_tree_equal(late.adaptation.moments, complete.adaptation.moments, True)
+            final, samples, info = run_fixed_random_walk(target, late, 2)
+            self.assert_tree_equal(samples, all_samples, True)
+            self.assert_tree_equal(info, all_info, True)
+            self.assert_tree_equal(final.model_state, all_final.model_state, True)
+            np.testing.assert_array_equal(jax.random.key_data(final.key),
+                                          jax.random.key_data(all_final.key))
+            self.assertEqual(final.iteration, 7)
 
-    def test_checkpoint_requires_consistent_adaptation_metadata(self):
-        target, state, initial = reference.make_fixture()
-        chain = initialize_random_walk_warmup(
-            target, state, jax.random.key(966), num_warmup=3, num_initial=1,
-            V_prop=initial,
-        )
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "warmup.npz"
-            save_checkpoint(path, target, chain)
-            with np.load(path, allow_pickle=False) as archive:
-                original = {name: archive[name] for name in archive.files}
-            for changes in (
-                {"protocol": "other"}, {"num_initial": 4}, {"num_warmup": 0},
-            ):
-                metadata = json.loads(str(original["metadata"].item()))
-                metadata["adaptation"].update(changes)
-                np.savez_compressed(path, **dict(
-                    original, metadata=np.asarray(json.dumps(metadata))
-                ))
-                with self.assertRaises(ValueError):
-                    load_checkpoint(path, target)
 
 
 if __name__ == "__main__":

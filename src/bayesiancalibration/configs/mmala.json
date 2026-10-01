@@ -1,0 +1,6 @@
+{
+  "method": "mmala",
+  "epsilon": 0.1,
+  "epsilon_G": 1e-06,
+  "target_accept": 0.574
+}

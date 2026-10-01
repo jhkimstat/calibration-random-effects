@@ -1,10 +1,7 @@
 """Standard NUTS/window references, Gibbs dependencies and posterior stationarity."""
 
-import json
-import tempfile
 import unittest
 from dataclasses import replace
-from pathlib import Path
 
 import blackjax
 import jax
@@ -26,10 +23,9 @@ from bayesiancalibration.gibbs import (
 )
 from bayesiancalibration.gp import LibraryGP
 from bayesiancalibration.mcmc import (
-    nuts_gibbs_sweep, initialize_nuts_warmup, initialize_nuts_chain,
+    nuts_gibbs_sweep, initialize_nuts_warmup,
     run_nuts_warmup, run_fixed_nuts, validate_nuts_chain,
 )
-from bayesiancalibration.run import save_checkpoint, load_checkpoint
 from bayesiancalibration.samplers.nuts import nuts_sweep
 from bayesiancalibration.state import CalibrationState, SpatialPrior, ThetaStandardization
 from bayesiancalibration.targets import CalibrationTarget
@@ -206,7 +202,7 @@ class NUTSTest(unittest.TestCase):
             self.assert_tree_equal(jax.random.key_data(actual_key),
                                    jax.random.key_data(next_key), True)
 
-    def test_window_restart_and_frozen_production(self):
+    def test_window_batches_and_frozen_production(self):
         for bounded, loading, key in ((False, False, jax.random.key(1203)),
                                      (True, True, jax.random.PRNGKey(1204))):
             target, s, _ = reference.make_fixture(bounded, loading)
@@ -218,40 +214,34 @@ class NUTSTest(unittest.TestCase):
             self.assertEqual(initial.adaptation.target_accept, .8)
             all_chain, all_draws, all_info = run_nuts_warmup(target, initial)
             production, draws, diagnostics = run_fixed_nuts(target, all_chain, 2)
-            part, first_draws, first_info = run_nuts_warmup(target, initial, 9)
-            with tempfile.TemporaryDirectory() as directory:
-                path = Path(directory)/'nuts.npz'
-                for boundary in (initial, part, all_chain):
-                    save_checkpoint(path, target, boundary)
-                    restored, metadata = load_checkpoint(path, target)
-                    self.assertEqual(metadata['sampler'],
-                                     'collapsed_nuts' if self.collapsed else 'uncollapsed_nuts')
-                    self.assertEqual(restored.collapsed, self.collapsed)
-                    self.assert_tree_equal(restored.adaptation.state,
-                                           boundary.adaptation.state, True)
-                    self.assertEqual(restored.key.dtype, boundary.key.dtype)
-                    if restored.phase == 'warmup':
-                        finished, rest_draws, rest_info = run_nuts_warmup(target, restored)
-                        offset = boundary.iteration
-                        self.assert_tree_equal(
-                            rest_draws, jax.tree.map(lambda x: x[offset:], all_draws), True
-                        )
-                        self.assert_tree_equal(
-                            rest_info, jax.tree.map(lambda x: x[offset:], all_info), True
-                        )
-                    else:
-                        finished = restored
-                    final_chain, more, more_info = run_fixed_nuts(target, finished, 2)
-                    self.assert_tree_equal(more, draws, True)
-                    self.assert_tree_equal(more_info, diagnostics, True)
-                    self.assert_tree_equal(final_chain.model_state, production.model_state, True)
-                    self.assert_tree_equal(final_chain.adaptation.state,
-                                           all_chain.adaptation.state, True)
-                    np.testing.assert_array_equal(final_chain.inverse_mass_matrix,
-                                                  all_chain.inverse_mass_matrix)
-                    self.assertEqual(final_chain.step_size, all_chain.step_size)
+            part, _, _ = run_nuts_warmup(target, initial, 9)
+            for boundary in (initial, part, all_chain):
+                self.assertEqual(boundary.collapsed, self.collapsed)
+                self.assertEqual(boundary.key.dtype, initial.key.dtype)
+                if boundary.phase == 'warmup':
+                    finished, rest_draws, rest_info = run_nuts_warmup(target, boundary)
+                    offset = boundary.iteration
+                    self.assert_tree_equal(
+                        rest_draws, jax.tree.map(lambda x: x[offset:], all_draws), True
+                    )
+                    self.assert_tree_equal(
+                        rest_info, jax.tree.map(lambda x: x[offset:], all_info), True
+                    )
+                else:
+                    finished = boundary
+                final_chain, more, more_info = run_fixed_nuts(target, finished, 2)
+                self.assert_tree_equal(more, draws, True)
+                self.assert_tree_equal(more_info, diagnostics, True)
+                self.assert_tree_equal(final_chain.model_state, production.model_state, True)
+                self.assert_tree_equal(final_chain.adaptation.state,
+                                       all_chain.adaptation.state, True)
+                np.testing.assert_array_equal(final_chain.inverse_mass_matrix,
+                                              all_chain.inverse_mass_matrix)
+                np.testing.assert_array_equal(jax.random.key_data(final_chain.key),
+                                              jax.random.key_data(production.key))
+                self.assertEqual(final_chain.step_size, all_chain.step_size)
 
-    def test_invalid_configuration_and_checkpoint_payload(self):
+    def test_invalid_configuration_and_chain_state(self):
         target, s, _ = reference.make_fixture()
         for kwargs in ({'num_warmup': 0}, {'num_warmup': True}, {'target_accept': 1.0},
                        {'initial_step_size': 0}, {'max_num_doublings': 0}):
@@ -271,15 +261,6 @@ class NUTSTest(unittest.TestCase):
             run_fixed_nuts(target, chain, 1)
         with self.assertRaises(ValueError):
             run_nuts_warmup(target, chain, 4)
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory)/'nuts.npz'
-            save_checkpoint(path, target, chain)
-            with np.load(path, allow_pickle=False) as a:
-                payload = {name: a[name] for name in a.files}
-            payload['sampler.step_size'] = np.asarray(.5)
-            np.savez_compressed(path, **payload)
-            with self.assertRaisesRegex(ValueError, 'checksum'):
-                load_checkpoint(path, target)
 
     def test_posterior_joint_moments_preserved_against_independent_quadrature(self):
         for bounded in (False, True):

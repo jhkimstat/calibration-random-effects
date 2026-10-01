@@ -1,10 +1,7 @@
 """Dense MALA proposal references, posterior quadrature, and Gibbs integration."""
 
-import json
-import tempfile
 import unittest
 from dataclasses import replace
-from pathlib import Path
 from unittest.mock import patch
 
 import jax
@@ -28,7 +25,6 @@ from bayesiancalibration.gibbs import (
 from bayesiancalibration.gp import LibraryGP
 from bayesiancalibration.mcmc import (
     collapsed_gibbs_sweep,
-    initialize_mala_chain,
     initialize_mala_warmup,
     run_fixed_mala,
     run_fixed_random_walk,
@@ -36,7 +32,6 @@ from bayesiancalibration.mcmc import (
     WarmupTuningError,
     validate_mala_chain,
 )
-from bayesiancalibration.run import load_checkpoint, save_checkpoint
 from bayesiancalibration.samplers.metropolis import (
     collapsed_mala_sweep,
     update_collapsed_mala,
@@ -315,7 +310,7 @@ class MALAGibbsTest(unittest.TestCase):
                                           np.zeros((2, 2, 2)))
             self.assertFalse(np.array_equal(samples.c_f[0], samples.c_f[-1]))
 
-    def test_warmup_checkpoint_restart_and_production_are_bitwise_equal(self):
+    def test_warmup_batches_and_production_match_one_run(self):
         for bounded, loading_only, key in (
             (False, False, jax.random.key(1033)),
             (True, True, jax.random.PRNGKey(1034)),
@@ -328,50 +323,24 @@ class MALAGibbsTest(unittest.TestCase):
             full, warm_samples, warm_info = run_mala_warmup(target, chain)
             expected, expected_samples, expected_info = run_fixed_mala(target, full, 2)
             partial, early, early_info = run_mala_warmup(target, chain, 3)
-            with tempfile.TemporaryDirectory() as directory:
-                path = Path(directory) / "mala.npz"
-                save_checkpoint(path, target, partial)
-                restored, metadata = load_checkpoint(path, target)
-                self.assertEqual(metadata["sampler"], "collapsed_mala")
-                self.assertEqual(restored.epsilon, partial.epsilon)
-                late, late_samples, late_info = run_mala_warmup(target, restored)
-                self.assert_tree_equal(jax.tree.map(
-                    lambda a, b: jnp.concatenate((a, b)), early, late_samples
-                ), warm_samples, True)
-                self.assert_tree_equal(jax.tree.map(
-                    lambda a, b: jnp.concatenate((a, b)), early_info, late_info
-                ), warm_info, True)
-                np.testing.assert_array_equal(late.V_prop, full.V_prop)
-                save_checkpoint(path, target, late)
-                frozen, _ = load_checkpoint(path, target)
-                final, samples, info = run_fixed_mala(target, frozen, 2)
-                self.assert_tree_equal(samples, expected_samples, True)
-                self.assert_tree_equal(info, expected_info, True)
-                self.assert_tree_equal(final.model_state, expected.model_state, True)
-                np.testing.assert_array_equal(jax.random.key_data(final.key),
-                                              jax.random.key_data(expected.key))
-                self.assertEqual(final.iteration, 7)
+            self.assertEqual(partial.epsilon, chain.epsilon)
+            late, late_samples, late_info = run_mala_warmup(target, partial)
+            self.assert_tree_equal(jax.tree.map(
+                lambda a, b: jnp.concatenate((a, b)), early, late_samples
+            ), warm_samples, True)
+            self.assert_tree_equal(jax.tree.map(
+                lambda a, b: jnp.concatenate((a, b)), early_info, late_info
+            ), warm_info, True)
+            np.testing.assert_array_equal(late.V_prop, full.V_prop)
+            self.assert_tree_equal(late.adaptation.moments, full.adaptation.moments, True)
+            final, samples, info = run_fixed_mala(target, late, 2)
+            self.assert_tree_equal(samples, expected_samples, True)
+            self.assert_tree_equal(info, expected_info, True)
+            self.assert_tree_equal(final.model_state, expected.model_state, True)
+            np.testing.assert_array_equal(jax.random.key_data(final.key),
+                                          jax.random.key_data(expected.key))
+            self.assertEqual(final.iteration, 7)
 
-    def test_checkpoint_preserves_and_checks_sampler_tuning(self):
-        target, state, P = outer_reference.make_fixture()
-        chain = initialize_mala_chain(target, state, jax.random.key(1035), P, 0.4)
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "mala.npz"
-            save_checkpoint(path, target, chain)
-            with np.load(path, allow_pickle=False) as archive:
-                original = {name: archive[name] for name in archive.files}
-            # Epsilon is part of the checksummed array payload, like V_prop.
-            changed = dict(original, **{"sampler.epsilon": np.asarray(0.5)})
-            np.savez_compressed(path, **changed)
-            with self.assertRaisesRegex(ValueError, "checksum"):
-                load_checkpoint(path, target)
-            metadata = json.loads(str(original["metadata"].item()))
-            metadata["sampler"] = "collapsed_random_walk"
-            np.savez_compressed(path, **dict(
-                original, metadata=np.asarray(json.dumps(metadata))
-            ))
-            with self.assertRaisesRegex(ValueError, "MALA tuning"):
-                load_checkpoint(path, target)
 
 
 class MALAPosteriorTest(unittest.TestCase):

@@ -1,10 +1,7 @@
-"""Standard DA reference, dynamic epsilon, phase boundaries, and restart."""
+"""Standard DA reference, dynamic epsilon, phase boundaries, and batching."""
 
-import json
-import tempfile
 import unittest
 from dataclasses import replace
-from pathlib import Path
 
 import jax
 
@@ -22,7 +19,6 @@ from bayesiancalibration.mcmc import (
     run_mala_warmup,
     validate_mala_chain,
 )
-from bayesiancalibration.run import load_checkpoint, save_checkpoint
 import test_mcmc as reference
 
 
@@ -155,7 +151,7 @@ class MALADualAveragingTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "warmup schedule"):
             validate_mala_chain(target, replace(fixed, step_size_adaptation=adaptation))
 
-    def test_coupled_covariance_da_checkpoint_continuation_is_bitwise(self):
+    def test_coupled_covariance_da_batches_match_one_run(self):
         for bounded, loading_only, key in (
             (False, False, jax.random.key(1113)),
             (True, True, jax.random.PRNGKey(1114)),
@@ -167,66 +163,27 @@ class MALADualAveragingTest(unittest.TestCase):
             )
             full, full_samples, full_info = run_mala_warmup(target, chain)
             expected, expected_draws, expected_info = run_fixed_mala(target, full, 2)
-            with tempfile.TemporaryDirectory() as directory:
-                path = Path(directory) / "mala.npz"
-                # Checkpoint before the first update preserves initial scalar
-                # statistics, including standard DA's zero log average.
-                save_checkpoint(path, target, chain)
-                restored, _ = load_checkpoint(path, target)
-                first, early, early_info = run_mala_warmup(target, restored, 3)
-                save_checkpoint(path, target, first)
-                restored, metadata = load_checkpoint(path, target)
-                self.assertEqual(metadata["step_size_adaptation"]["protocol"],
-                                 "mala-dual-averaging-v1")
-                self.assertEqual(restored.step_size_adaptation.target_accept, 0.65)
-                self.assert_tree_equal(restored.step_size_adaptation.state,
-                                       first.step_size_adaptation.state, True)
-                late, late_samples, late_info = run_mala_warmup(target, restored)
-                self.assert_tree_equal(jax.tree.map(
-                    lambda a, b: jnp.concatenate((a, b)), early, late_samples
-                ), full_samples, True)
-                self.assert_tree_equal(jax.tree.map(
-                    lambda a, b: jnp.concatenate((a, b)), early_info, late_info
-                ), full_info, True)
-                self.assertEqual(late.epsilon, full.epsilon)
-                self.assert_tree_equal(late.step_size_adaptation.state,
-                                       full.step_size_adaptation.state, True)
-                np.testing.assert_array_equal(late.V_prop, full.V_prop)
-                save_checkpoint(path, target, late)
-                frozen, _ = load_checkpoint(path, target)
-                final, draws, info = run_fixed_mala(target, frozen, 2)
-                self.assert_tree_equal(draws, expected_draws, True)
-                self.assert_tree_equal(info, expected_info, True)
-                self.assert_tree_equal(final.model_state, expected.model_state, True)
-                np.testing.assert_array_equal(jax.random.key_data(final.key),
-                                              jax.random.key_data(expected.key))
-                self.assertEqual(final.iteration, 10)
+            first, early, early_info = run_mala_warmup(target, chain, 3)
+            self.assertEqual(first.step_size_adaptation.target_accept, 0.65)
+            late, late_samples, late_info = run_mala_warmup(target, first)
+            self.assert_tree_equal(jax.tree.map(
+                lambda a, b: jnp.concatenate((a, b)), early, late_samples
+            ), full_samples, True)
+            self.assert_tree_equal(jax.tree.map(
+                lambda a, b: jnp.concatenate((a, b)), early_info, late_info
+            ), full_info, True)
+            self.assertEqual(late.epsilon, full.epsilon)
+            self.assert_tree_equal(late.step_size_adaptation.state,
+                                   full.step_size_adaptation.state, True)
+            np.testing.assert_array_equal(late.V_prop, full.V_prop)
+            final, draws, info = run_fixed_mala(target, late, 2)
+            self.assert_tree_equal(draws, expected_draws, True)
+            self.assert_tree_equal(info, expected_info, True)
+            self.assert_tree_equal(final.model_state, expected.model_state, True)
+            np.testing.assert_array_equal(jax.random.key_data(final.key),
+                                          jax.random.key_data(expected.key))
+            self.assertEqual(final.iteration, 10)
 
-    def test_checkpoint_rejects_corrupt_or_unconfigured_da_payload(self):
-        target, state, P = reference.make_fixture()
-        chain = initialize_mala_warmup(
-            target, state, jax.random.key(1115), num_warmup=4, num_initial=2,
-            epsilon=0.4, V_prop=P, target_accept=0.65,
-        )
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "mala.npz"
-            save_checkpoint(path, target, chain)
-            with np.load(path, allow_pickle=False) as archive:
-                original = {name: archive[name] for name in archive.files}
-            for name in ("step_size.target_accept", "step_size.log_step_size_avg"):
-                changed = dict(original)
-                changed[name] = changed[name] + 0.01
-                np.savez_compressed(path, **changed)
-                with self.assertRaisesRegex(ValueError, "checksum"):
-                    load_checkpoint(path, target)
-            for specification in (None, {"protocol": "other"}):
-                metadata = json.loads(str(original["metadata"].item()))
-                metadata["step_size_adaptation"] = specification
-                np.savez_compressed(path, **dict(
-                    original, metadata=np.asarray(json.dumps(metadata))
-                ))
-                with self.assertRaises(ValueError):
-                    load_checkpoint(path, target)
 
     def test_unusable_adapted_epsilon_stops_without_clipping_or_partial_chain(self):
         target, state, P = reference.make_fixture()

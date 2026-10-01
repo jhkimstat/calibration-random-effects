@@ -1,0 +1,5 @@
+{
+  "method": "mh",
+  "num_initial": 100,
+  "initial_proposal_variance": 1e-06
+}

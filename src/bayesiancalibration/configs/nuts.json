@@ -1,0 +1,9 @@
+{
+  "method": "nuts",
+  "initial_step_size": 1.0,
+  "target_accept": 0.8,
+  "mass_structure": "diagonal",
+  "block_size": null,
+  "max_num_doublings": 10,
+  "divergence_threshold": 1000.0
+}

@@ -238,9 +238,94 @@ def profile_log_likelihood(
     )
 
 
+def _cv_residual_and_variance(
+    log_lambda_c: Array,
+    theta_s_tilde: Array,
+    F_s: Array,
+    *,
+    jitter: float = 0.0,
+) -> tuple[Array, Array]:
+    """Share exact fold predictions between NLPD and WMSE without divergence.
+
+    For each held-out row, factor the (r-1, r-1) training correlation,
+    estimate each of k output variances from those training rows alone, and
+    return residual and predictive variance arrays of shape (r, k).
+    Batched triangular solves avoid inverse matrices.
+    ``jitter`` follows the same fixed factorization policy as the GP fit.
+    """
+
+    theta_s_tilde = jnp.asarray(theta_s_tilde)
+    F_s = jnp.asarray(F_s)
+    r, k = F_s.shape
+    C_ss = squared_exponential_kernel(
+        theta_s_tilde, theta_s_tilde, jnp.exp(log_lambda_c)
+    )
+    rows = jnp.arange(r)
+    training = jnp.where(
+        jnp.arange(r - 1)[None, :] < rows[:, None],
+        jnp.arange(r - 1)[None, :],
+        jnp.arange(r - 1)[None, :] + 1,
+    )
+    C_minus = C_ss[training[:, :, None], training[:, None, :]]
+    L_minus = jnp.linalg.cholesky(C_minus + jitter * jnp.eye(r - 1))
+    F_minus = F_s[training]
+    whitened_F = jsp.linalg.solve_triangular(L_minus, F_minus, lower=True)
+    k_j_minus = C_ss[rows[:, None], training]
+    whitened_k = jsp.linalg.solve_triangular(
+        L_minus, k_j_minus[..., None], lower=True
+    )[..., 0]
+    c_hat = jnp.einsum("ji,jik->jk", whitened_k, whitened_F)
+    sigma_c2_minus = jnp.sum(jnp.square(whitened_F), axis=1) / (r - 1)
+    conditional_variance = 1.0 - jnp.sum(jnp.square(whitened_k), axis=1)
+    predictive_variance = conditional_variance[:, None] * sigma_c2_minus
+    residual = F_s - c_hat
+    return residual, predictive_variance
+
+
+def cv_nlpd(
+    log_lambda_c: Array,
+    theta_s_tilde: Array,
+    F_s: Array,
+    *,
+    jitter: float = 0.0,
+) -> Array:
+    """Mean leave-one-run-out NLPD for zero-mean coefficient GP columns."""
+
+    residual, predictive_variance = _cv_residual_and_variance(
+        log_lambda_c, theta_s_tilde, F_s, jitter=jitter
+    )
+    k = F_s.shape[1]
+    nlpd = 0.5 * (
+        k * jnp.log(2.0 * jnp.pi)
+        + jnp.sum(jnp.log(predictive_variance), axis=1)
+        + jnp.sum(jnp.square(residual) / predictive_variance, axis=1)
+    )
+    return jnp.mean(nlpd)
+
+
+def cv_wmse(
+    log_lambda_c: Array,
+    theta_s_tilde: Array,
+    F_s: Array,
+    *,
+    jitter: float = 0.0,
+) -> Array:
+    """Mean foldwise sum of squared errors divided by predictive variances.
+
+    This is exactly the quadratic term inside twice the NLPD, averaged over
+    held-out runs. Dividing by k as well would only rescale the objective.
+    It is not a proper predictive score: inflated variances can reduce it.
+    """
+
+    residual, predictive_variance = _cv_residual_and_variance(
+        log_lambda_c, theta_s_tilde, F_s, jitter=jitter
+    )
+    return jnp.mean(jnp.sum(jnp.square(residual) / predictive_variance, axis=1))
+
+
 @dataclass(frozen=True)
 class FitAttempt:
-    """One optimizer start and its convergence record."""
+    """One optimizer start; objective follows the selected fitting method."""
 
     start: tuple[float, ...]
     optimum: tuple[float, ...] | None
@@ -255,8 +340,10 @@ class FitAttempt:
 class LengthScaleFit:
     """Frozen fitted length scales and reproducible library-fit diagnostics.
 
-    ``profiled_variances`` are fitting diagnostics, never sampled-state sigma_c2.
+    ``profiled_variances`` are full-library q_j/r diagnostics for every
+    selection method, never sampled-state sigma_c2.
     The numerical bounds constrain the optimizer search if explicitly given.
+    ``objective`` is maximized for ``profile`` and minimized for CV methods.
     """
 
     lambda_c: Array
@@ -270,6 +357,7 @@ class LengthScaleFit:
     maxiter: int
     jitter: float
     scipy_version: str
+    method: str = "profile"
 
 
 def fit_library_length_scales(
@@ -282,9 +370,12 @@ def fit_library_length_scales(
     maxiter: int,
     log_bounds: Array | None = None,
     jitter: float = 0.0,
+    method: str = "profile",
 ) -> LengthScaleFit:
-    """Maximize the library-only profile objective over log length scales.
+    """Select length scales by profile likelihood, CV–NLPD, or CV–WMSE.
 
+    ``method='profile'`` maximizes the zero-mean full-library profile log
+    likelihood; the CV methods minimize mean leave-one-run-out scores.
     The caller supplies all starts and stopping tolerances. Optional finite
     ``log_bounds`` (d, 2) are an explicit optimizer search restriction, not a
     GP prior. Every candidate is checked before jitter, and invalid starts or
@@ -292,6 +383,8 @@ def fit_library_length_scales(
     """
 
     theta_np, F_np = _validate_library_inputs(theta_s_tilde, F_s, jitter)
+    if method not in ("profile", "cv_nlpd", "cv_wmse"):
+        raise ValueError("method must be 'profile', 'cv_nlpd', or 'cv_wmse'")
     if np.any(np.all(F_np == 0.0, axis=0)):
         raise ValueError("A zero coefficient column has no positive variance MLE")
     d = theta_np.shape[1]
@@ -317,12 +410,18 @@ def fit_library_length_scales(
 
     theta = jnp.asarray(theta_np)
     F = jnp.asarray(F_np)
+    objective = {
+        "profile": profile_log_likelihood,
+        "cv_nlpd": cv_nlpd,
+        "cv_wmse": cv_wmse,
+    }[method]
+    sign = -1.0 if method == "profile" else 1.0
     evaluate = jax.jit(jax.value_and_grad(
-        lambda xi: profile_log_likelihood(xi, theta, F, jitter=jitter)
+        lambda xi: objective(xi, theta, F, jitter=jitter)
     ))
 
     # SciPy needs host scalars/arrays; JAX retains the differentiable kernel.
-    def negative_value_and_grad(xi: np.ndarray) -> tuple[float, np.ndarray]:
+    def minimization_value_and_grad(xi: np.ndarray) -> tuple[float, np.ndarray]:
         with np.errstate(over="ignore", under="ignore"):
             lambda_candidate = np.exp(xi)
         if not np.all(np.isfinite(lambda_candidate)) or np.any(lambda_candidate <= 0):
@@ -332,14 +431,14 @@ def fit_library_length_scales(
         value_np = float(value)
         gradient_np = np.asarray(gradient)
         if not np.isfinite(value_np) or not np.all(np.isfinite(gradient_np)):
-            raise ValueError("Profile likelihood or gradient is nonfinite")
-        return -value_np, -gradient_np
+            raise ValueError(f"{method} objective or gradient is nonfinite")
+        return sign * value_np, sign * gradient_np
 
     attempts: list[FitAttempt] = []
     for start in starts_np:
         try:
             result = minimize(
-                negative_value_and_grad,
+                minimization_value_and_grad,
                 start,
                 jac=True,
                 method="L-BFGS-B",
@@ -349,7 +448,7 @@ def fit_library_length_scales(
             attempts.append(FitAttempt(
                 tuple(map(float, start)),
                 tuple(map(float, result.x)),
-                -float(result.fun),
+                sign * float(result.fun),
                 bool(result.success),
                 str(result.message),
                 int(result.nit),
@@ -365,12 +464,14 @@ def fit_library_length_scales(
     if not successful:
         messages = "; ".join(attempt.message for attempt in attempts)
         raise ValueError(f"No length-scale fit converged: {messages}")
-    best = max(successful, key=lambda attempt: attempt.objective)
+    best = (max if method == "profile" else min)(
+        successful, key=lambda attempt: attempt.objective
+    )
     log_lambda_c = jnp.asarray(best.optimum)
     lambda_c = jnp.exp(log_lambda_c)
     library = LibraryGP.from_data(theta, F, lambda_c, jitter=jitter)
     return LengthScaleFit(
         lambda_c, log_lambda_c, library.q_s / theta.shape[0],
         best.objective, tuple(attempts), bounds,
-        float(gtol), float(ftol), maxiter, float(jitter), scipy_version,
+        float(gtol), float(ftol), maxiter, float(jitter), scipy_version, method,
     )

@@ -1,9 +1,6 @@
-"""Eta-space mass structures: moment identities, standard driver, Gibbs restart."""
-import json
-import tempfile
+"""Eta-space mass structures: moment identities, standard driver, Gibbs batches."""
 import unittest
 from dataclasses import replace
-from pathlib import Path
 
 import blackjax
 import jax
@@ -13,7 +10,6 @@ import numpy as np
 from blackjax.adaptation.staged_adaptation import build_schedule
 from blackjax.mcmc import nuts
 
-from bayesiancalibration import comparison
 from bayesiancalibration.adaptation import (
     nuts_window_adapter, kronecker_factors, validate_nuts_mass,
 )
@@ -21,7 +17,6 @@ from bayesiancalibration.mcmc import (
     initialize_nuts_warmup, run_nuts_warmup, run_fixed_nuts, validate_nuts_chain,
 )
 from bayesiancalibration.samplers.nuts import nuts_sweep
-from bayesiancalibration.run import save_checkpoint, load_checkpoint
 import test_mcmc as reference
 
 
@@ -138,7 +133,7 @@ class NUTSMassTest(unittest.TestCase):
                     np.testing.assert_array_equal(eta.reshape(-1), expected.position)
                     np.testing.assert_array_equal(got.acceptance_rate, info.acceptance_rate)
 
-    def test_structured_warmup_restart_and_freeze(self):
+    def test_structured_warmup_batches_and_freeze(self):
         for structure in ('dense', 'kronecker'):
             for collapsed in (False, True):
                 target, state, _ = reference.make_fixture(bounded=collapsed, loading_only=True)
@@ -147,42 +142,43 @@ class NUTSMassTest(unittest.TestCase):
                     mass_structure=structure)
                 complete, draws, info = run_nuts_warmup(target, chain)
                 part, _, _ = run_nuts_warmup(target, chain, 12)
-                with tempfile.TemporaryDirectory() as tmp:
-                    path = Path(tmp)/'state.npz'
-                    for boundary in (chain, part, complete):
-                        save_checkpoint(path, target, boundary)
-                        restored, metadata = load_checkpoint(path, target)
-                        self.assertEqual(restored.mass_structure, structure)
-                        self.assertEqual(metadata['nuts']['coordinates'], 'eta-v1')
-                        self.assert_tree_equal(restored.adaptation.state, boundary.adaptation.state, True)
-                        if restored.phase == 'warmup':
-                            restored, rest, diagnostics = run_nuts_warmup(target, restored)
-                            self.assert_tree_equal(rest, jax.tree.map(lambda x: x[boundary.iteration:], draws), True)
-                            self.assert_tree_equal(diagnostics, jax.tree.map(lambda x: x[boundary.iteration:], info), True)
-                        production, _, _ = run_fixed_nuts(target, restored, 2)
-                        self.assert_tree_equal(production.adaptation.state, complete.adaptation.state, True)
-                        np.testing.assert_array_equal(production.inverse_mass_matrix, complete.inverse_mass_matrix)
-                        self.assertEqual(production.step_size, complete.step_size)
+                for boundary in (chain, part, complete):
+                    self.assertEqual(boundary.mass_structure, structure)
+                    if boundary.phase == 'warmup':
+                        finished, rest, diagnostics = run_nuts_warmup(target, boundary)
+                        self.assert_tree_equal(
+                            rest, jax.tree.map(lambda x: x[boundary.iteration:], draws), True
+                        )
+                        self.assert_tree_equal(
+                            diagnostics, jax.tree.map(lambda x: x[boundary.iteration:], info), True
+                        )
+                    else:
+                        finished = boundary
+                    production, _, _ = run_fixed_nuts(target, finished, 2)
+                    self.assert_tree_equal(production.adaptation.state,
+                                           complete.adaptation.state, True)
+                    np.testing.assert_array_equal(production.inverse_mass_matrix,
+                                                  complete.inverse_mass_matrix)
+                    self.assertEqual(production.step_size, complete.step_size)
                 validate_nuts_mass(complete.inverse_mass_matrix, 4, structure, (2, 2))
                 self.assertFalse(np.allclose(complete.inverse_mass_matrix, np.eye(4)))
                 with self.assertRaises(ValueError):
                     validate_nuts_chain(target, replace(complete, inverse_mass_matrix=-jnp.eye(4)))
 
-    def test_comparison_dispatch_and_structure_validation(self):
-        config = json.loads((Path(__file__).resolve().parents[1] /
-                             'experiments/comparison.json').read_text())
+    def test_factory_mass_structure_validation_for_both_targets(self):
         target, state, _ = reference.make_fixture(loading_only=True)
         for structure in ('diagonal', 'dense', 'kronecker'):
-            config['nuts_mass_structure'] = structure
-            comparison.validate_config(config)
-            for method in ('nuts', 'collapsed_nuts'):
-                chain = comparison.initialize_chain(target, state, config, method, 0)
+            for collapsed in (False, True):
+                chain = initialize_nuts_warmup(
+                    target, state, jax.random.key(946), mass_structure=structure,
+                    collapsed=collapsed,
+                )
                 self.assertEqual(chain.mass_structure, structure)
                 shape = (4,) if structure == 'diagonal' else (4, 4)
                 self.assertEqual(chain.inverse_mass_matrix.shape, shape)
-        config['nuts_mass_structure'] = 'invalid'
         with self.assertRaises(ValueError):
-            comparison.validate_config(config)
+            initialize_nuts_warmup(target, state, jax.random.key(946),
+                                   mass_structure='invalid')
 
     def test_invalid_structure_and_spd(self):
         for structure in ('dense', 'kronecker'):

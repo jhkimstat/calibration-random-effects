@@ -1,0 +1,7 @@
+{
+  "method": "mala",
+  "num_initial": 100,
+  "initial_proposal_variance": 1.0,
+  "epsilon": 0.1,
+  "target_accept": 0.574
+}

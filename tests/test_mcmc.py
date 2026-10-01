@@ -1,11 +1,7 @@
-"""Outer-sweep ordering, joint stationarity, and checkpoint restart tests."""
+"""Outer-sweep ordering, joint stationarity, and numerical batching."""
 
-import hashlib
-import json
-import tempfile
 import unittest
 from dataclasses import replace
-from pathlib import Path
 from unittest.mock import patch
 
 import jax
@@ -31,7 +27,6 @@ from bayesiancalibration.mcmc import (
     run_fixed_random_walk,
     validate_random_walk_chain,
 )
-from bayesiancalibration.run import load_checkpoint, save_checkpoint
 from bayesiancalibration.samplers.metropolis import update_collapsed_random_walk
 from bayesiancalibration.state import (
     CalibrationState,
@@ -169,10 +164,10 @@ class GibbsSweepTest(unittest.TestCase):
         self.assertEqual(chain.iteration, 0)
 
 
-class CheckpointTest(unittest.TestCase):
+class NumericalBatchingTest(unittest.TestCase):
     assert_tree_equal = GibbsSweepTest.assert_tree_equal
 
-    def test_restart_matches_uninterrupted_chain_for_typed_and_legacy_keys(self):
+    def test_batches_match_one_run_for_typed_and_legacy_keys(self):
         for bounded, loading_only, key in (
             (False, False, jax.random.key(910)),
             (True, True, jax.random.PRNGKey(911)),
@@ -180,103 +175,21 @@ class CheckpointTest(unittest.TestCase):
             with self.subTest(bounded=bounded, loading_only=loading_only):
                 target, state, proposal = make_fixture(bounded, loading_only)
                 initial = initialize_random_walk_chain(target, state, key, proposal)
-                complete, all_samples, all_info = run_fixed_random_walk(
-                    target, initial, 5
+                complete, all_samples, all_info = run_fixed_random_walk(target, initial, 5)
+                part, first_samples, first_info = run_fixed_random_walk(target, initial, 2)
+                final, last_samples, last_info = run_fixed_random_walk(target, part, 3)
+                self.assert_tree_equal(jax.tree.map(
+                    lambda a, b: jnp.concatenate((a, b)), first_samples, last_samples
+                ), all_samples, True)
+                self.assert_tree_equal(jax.tree.map(
+                    lambda a, b: jnp.concatenate((a, b)), first_info, last_info
+                ), all_info, True)
+                self.assert_tree_equal(final.model_state, complete.model_state, True)
+                np.testing.assert_array_equal(
+                    jax.random.key_data(final.key), jax.random.key_data(complete.key)
                 )
-                part, first_samples, first_info = run_fixed_random_walk(
-                    target, initial, 2
-                )
-                with tempfile.TemporaryDirectory() as directory:
-                    path = Path(directory) / "chain.npz"
-                    note = Path(directory) / "Sampling.md"
-                    note.write_text("synthetic reference specification")
-                    save_checkpoint(
-                        path, target, part, configuration={"chain_id": 0},
-                        source_paths={"Sampling.md": note},
-                    )
-                    restored, metadata = load_checkpoint(
-                        path, target, source_paths={"Sampling.md": note}
-                    )
-                    self.assert_tree_equal(restored.model_state, part.model_state, True)
-                    self.assertEqual(restored.key.dtype, part.key.dtype)
-                    np.testing.assert_array_equal(
-                        jax.random.key_data(restored.key), jax.random.key_data(part.key)
-                    )
-                    self.assertEqual(metadata["iteration"], 2)
-                    self.assertEqual(metadata["configuration"], {"chain_id": 0})
-                    self.assertEqual(metadata["source_hashes"]["Sampling.md"],
-                                     hashlib.sha256(note.read_bytes()).hexdigest())
-                    final, last_samples, last_info = run_fixed_random_walk(
-                        target, restored, 3
-                    )
-                    joined_samples = jax.tree.map(
-                        lambda a, b: jnp.concatenate((a, b)),
-                        first_samples, last_samples
-                    )
-                    joined_info = jax.tree.map(
-                        lambda a, b: jnp.concatenate((a, b)), first_info, last_info
-                    )
-                    self.assert_tree_equal(joined_samples, all_samples, True)
-                    self.assert_tree_equal(joined_info, all_info, True)
-                    self.assert_tree_equal(
-                        final.model_state, complete.model_state, True
-                    )
-                    np.testing.assert_array_equal(
-                        jax.random.key_data(final.key),
-                        jax.random.key_data(complete.key)
-                    )
-                    self.assertEqual(final.iteration, complete.iteration)
-
-    def test_incompatible_or_corrupt_checkpoint_is_rejected(self):
-        target, state, proposal = make_fixture()
-        chain = initialize_random_walk_chain(
-            target, state, jax.random.key(912), proposal
-        )
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "chain.npz"
-            save_checkpoint(path, target, chain)
-            with self.assertRaisesRegex(ValueError, "fixed target"):
-                load_checkpoint(path, replace(target, alpha_c_0=target.alpha_c_0 + 0.1))
-            with self.assertRaisesRegex(ValueError, "source hashes"):
-                load_checkpoint(path, target, source_paths={"data": path})
-            with np.load(path, allow_pickle=False) as archive:
-                original = {name: archive[name] for name in archive.files}
-            for field, value in (
-                ("schema_version", 99), ("key_protocol", "other"),
-                ("packages", {}), ("implementation_hashes", {}),
-                ("jax_configuration", {}),
-                ("iteration", -1), ("phase", "warmup"),
-            ):
-                metadata = json.loads(str(original["metadata"].item()))
-                metadata[field] = value
-                changed = dict(original, metadata=np.asarray(json.dumps(metadata)))
-                np.savez_compressed(path, **changed)
-                with self.subTest(field=field):
-                    with self.assertRaises(ValueError):
-                        load_checkpoint(path, target)
-            changed = dict(original)
-            changed["state.c_f"] = original["state.c_f"] + 0.1
-            np.savez_compressed(path, **changed)
-            with self.assertRaisesRegex(ValueError, "checksum"):
-                load_checkpoint(path, target)
-
-    def test_interrupted_atomic_replace_preserves_old_checkpoint(self):
-        target, state, proposal = make_fixture()
-        chain = initialize_random_walk_chain(
-            target, state, jax.random.key(913), proposal
-        )
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "chain.npz"
-            save_checkpoint(path, target, chain)
-            old_bytes = path.read_bytes()
-            with patch("bayesiancalibration.run.os.replace",
-                       side_effect=OSError("full")):
-                with self.assertRaises(OSError):
-                    save_checkpoint(path, target, replace(chain, iteration=1))
-            self.assertEqual(path.read_bytes(), old_bytes)
-            self.assertEqual(list(Path(directory).iterdir()), [path])
-            restored, _ = load_checkpoint(path, target)
-            self.assertEqual(restored.iteration, 0)
+                self.assertEqual(final.key.dtype, initial.key.dtype)
+                self.assertEqual(final.iteration, complete.iteration)
 
 
 class JointStationarityTest(unittest.TestCase):

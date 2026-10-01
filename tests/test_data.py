@@ -1,6 +1,7 @@
 """Independent spline, alignment, and supplied-data checks for Stage 14a."""
 
 import json
+import os
 import tempfile
 import unittest
 from importlib.util import find_spec
@@ -15,14 +16,13 @@ import numpy as np
 from scipy.linalg import qr
 from scipy.stats import linregress
 
-from bayesiancalibration import data
+from bayesiancalibration import data, preprocessing
 
 
-SOURCE = Path(
-    "/Users/jaehoonkim/Library/CloudStorage/OneDrive-TheOhioStateUniversity/"
-    "Chkrebtii, Oksana's files - Jaehoon research/Reference/"
-    "syn_theta_spatial_4chains_5re_Spatial"
-)
+# External supplied-data integration is optional; mathematical fixtures run everywhere.
+SOURCE = Path(os.environ["BAYESIANCALIBRATION_TEST_DATA"]) if (
+    "BAYESIANCALIBRATION_TEST_DATA" in os.environ
+) else None
 
 
 class SplineAndAlignmentTest(unittest.TestCase):
@@ -104,15 +104,15 @@ class SplineAndAlignmentTest(unittest.TestCase):
 
 
 @unittest.skipUnless(
-    all((SOURCE / name).is_file() for name in data._FILES)
+    SOURCE is not None and all((SOURCE / name).is_file() for name in preprocessing._FILES)
     and find_spec("openpyxl") is not None
     and find_spec("matplotlib") is not None,
-    "Supplied sources or optional preprocessing packages are unavailable",
+    "Set BAYESIANCALIBRATION_TEST_DATA to opt into supplied-data checks",
 )
 class SuppliedSyntheticTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.prepared = data.prepare_synthetic_data(SOURCE, seed=1024)
+        cls.prepared = preprocessing.prepare_synthetic_data(SOURCE, seed=1024)
 
     def test_shapes_coordinates_library_scale_and_fixed_noise(self) -> None:
         x = self.prepared
@@ -156,7 +156,7 @@ class SuppliedSyntheticTest(unittest.TestCase):
 
     def test_truth_is_evaluation_only_and_archive_is_pickle_free(self) -> None:
         x = self.prepared
-        original = data._load_csv
+        original = preprocessing._load_csv
 
         def changed_truth(path, *, header=None):
             value = original(path, header=header)
@@ -164,8 +164,8 @@ class SuppliedSyntheticTest(unittest.TestCase):
                 return value + 100.0
             return value
 
-        with patch.object(data, "_load_csv", side_effect=changed_truth):
-            changed = data.prepare_synthetic_data(SOURCE, seed=1024)
+        with patch.object(preprocessing, "_load_csv", side_effect=changed_truth):
+            changed = preprocessing.prepare_synthetic_data(SOURCE, seed=1024)
         np.testing.assert_array_equal(changed.F_s, x.F_s)
         np.testing.assert_array_equal(changed.theta_s_tilde, x.theta_s_tilde)
         np.testing.assert_array_equal(changed.y_tilde, x.y_tilde)
@@ -174,7 +174,7 @@ class SuppliedSyntheticTest(unittest.TestCase):
                                       x.theta_f_truth_for_evaluation + 100)
 
         with tempfile.TemporaryDirectory() as temporary:
-            data.save_prepared(x, temporary)
+            preprocessing.save_prepared(x, temporary)
             self.assertTrue((Path(temporary) / "slope_error.png").is_file())
             with np.load(Path(temporary) / "synthetic_preprocessing.npz",
                          allow_pickle=False) as archive:

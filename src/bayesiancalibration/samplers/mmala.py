@@ -8,7 +8,7 @@ import jax.scipy as jsp
 import numpy as np
 from blackjax.mcmc import random_walk
 from jax import Array
-from jax.experimental import checkify
+from bayesiancalibration.validation import check_quantity
 
 from bayesiancalibration.linalg import projected_marginal_moments
 from bayesiancalibration.samplers.metropolis import (
@@ -100,7 +100,7 @@ def collapsed_mmala_metric(
 def mmala_proposal_moments(
     target: CalibrationTarget, eta: Array, i: Array,
     delta: Array, sigma_y2: Array, mu_theta: Array, Sigma_theta: Array,
-    sigma_c2: Array, epsilon: Array, epsilon_G: Array,
+    sigma_c2: Array, epsilon: Array, epsilon_G: Array, *, role="current", current_origin=None,
 ) -> tuple[Array, Array]:
     """Return exact site proposal mean (d,) and covariance (d,d).
 
@@ -118,11 +118,22 @@ def mmala_proposal_moments(
     L_G = jnp.linalg.cholesky(G)
     mean = eta[i] + epsilon**2 / 2 * jsp.linalg.cho_solve((L_G, True), gradient)
     covariance = epsilon**2 * jsp.linalg.cho_solve((L_G, True), jnp.eye(eta.shape[1]))
-    checkify.debug_check(
-        jnp.all(jnp.isfinite(mean)) & jnp.all(jnp.isfinite(covariance))
-        & jnp.all(jnp.diag(covariance) > 0),
-        "MMALA gradient/metric/diffusion is invalid",
-    )
+    valid = (jnp.all(jnp.isfinite(mean)) & jnp.all(jnp.isfinite(covariance))
+             & jnp.all(jnp.diag(covariance) > 0))
+    if current_origin is None:
+        check_quantity(valid, update="eta", quantity="gradient_metric_diffusion", role=role, site=i,
+                       criterion="finite_positive_diffusion",
+                       description="MMALA gradient/metric/diffusion is invalid")
+    else:
+        # BlackJAX calls the same density for both directions. Label the
+        # origin using equality only for evidence; proposal decisions use
+        # the same unmodified moments and asymmetric density as before.
+        check_quantity(valid | ~current_origin, update="eta", quantity="gradient_metric_diffusion",
+                       role="current", site=i, criterion="finite_positive_diffusion",
+                       description="MMALA gradient/metric/diffusion is invalid")
+        check_quantity(valid | current_origin, update="eta", quantity="gradient_metric_diffusion",
+                       role="proposal", site=i, criterion="finite_positive_diffusion",
+                       description="MMALA gradient/metric/diffusion is invalid")
     return mean, (covariance + covariance.T) / 2
 
 
@@ -145,29 +156,32 @@ def collapsed_mmala_sweep(
     kernel = random_walk.build_rmh()
     def step(position, inputs):
         i, site_key = inputs
-        def density(site_eta):
+        def density(site_eta, *, role="proposal"):
             value = target.theta_only_collapsed(
                 position.at[i].set(site_eta), delta, sigma_y2,
                 mu_theta, Sigma_theta, sigma_c2,
             )
-            checkify.debug_check(~jnp.isnan(value) & ~jnp.isposinf(value),
-                                 "MMALA target evaluation produced NaN/+inf")
+            check_quantity(~jnp.isnan(value) & ~jnp.isposinf(value),
+                           update="eta", quantity="logdensity", role=role, site=i,
+                           criterion="not_nan_or_positive_infinity",
+                           description="MMALA target evaluation produced NaN/+inf")
             return value
-        def moments(site_eta):
+        def moments(site_eta, *, role, current_origin=None):
             return mmala_proposal_moments(
                 target, position.at[i].set(site_eta), i, delta, sigma_y2,
-                mu_theta, Sigma_theta, sigma_c2, epsilon, epsilon_G,
+                mu_theta, Sigma_theta, sigma_c2, epsilon, epsilon_G, role=role, current_origin=current_origin,
             )
         def propose(proposal_key, origin):
-            mean, covariance = moments(origin)
+            mean, covariance = moments(origin, role="current")
             return jax.random.multivariate_normal(
                 proposal_key, mean, covariance, dtype=jnp.float64, method="cholesky"
             )
         def proposal_logdensity(origin, destination):
-            mean, covariance = moments(origin.position)
+            mean, covariance = moments(origin.position, role="proposal",
+                                       current_origin=jnp.all(origin.position == position[i]))
             return jsp.stats.multivariate_normal.logpdf(destination.position, mean, covariance)
         updated, info = kernel(
-            site_key, random_walk.init(position[i], density), density,
+            site_key, random_walk.init(position[i], lambda site_eta: density(site_eta, role="current")), density,
             propose, proposal_logdensity,
         )
         return position.at[i].set(updated.position), (info.acceptance_rate, info.is_accepted)

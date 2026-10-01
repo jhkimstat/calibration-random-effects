@@ -15,7 +15,7 @@ import jax.numpy as jnp
 import numpy as np
 from blackjax.mcmc import mala, random_walk
 from jax import Array
-from jax.experimental import checkify
+from bayesiancalibration.validation import check_quantity
 
 from bayesiancalibration.targets import CalibrationTarget
 
@@ -78,13 +78,15 @@ def collapsed_mala_sweep(
     by the checkified chain driver. Close over target for JIT/vmap/scan.
     """
 
-    def logdensity_fn(position):
+    def logdensity_fn(position, *, site=None, role="selected"):
         value = target.theta_only_collapsed(
             position, delta, sigma_y2, mu_theta, Sigma_theta, sigma_c2
         )
         # -inf is a legitimate zero-density proposal; NaN/+inf is not.
-        checkify.debug_check(~jnp.isnan(value) & ~jnp.isposinf(value),
-                             "Metropolis target evaluation produced NaN/+inf")
+        check_quantity(~jnp.isnan(value) & ~jnp.isposinf(value),
+                       update="eta", quantity="logdensity", site=site, role=role,
+                       criterion="not_nan_or_positive_infinity",
+                       description="Metropolis target evaluation produced NaN/+inf")
         return value
 
     kernel = mala.build_kernel()
@@ -95,13 +97,14 @@ def collapsed_mala_sweep(
         i, site_key, L = inputs
         origin = position[i]
 
-        def site_logdensity(z):
-            return logdensity_fn(position.at[i].set(origin + L @ z))
+        def site_logdensity(z, *, role="proposal"):
+            return logdensity_fn(position.at[i].set(origin + L @ z), site=i, role=role)
 
-        state = mala.init(jnp.zeros_like(origin), site_logdensity)
-        checkify.debug_check(
+        state = mala.init(jnp.zeros_like(origin), lambda z: site_logdensity(z, role="current"))
+        check_quantity(
             jnp.isfinite(state.logdensity) & jnp.all(jnp.isfinite(state.logdensity_grad)),
-            "MALA current density/gradient is nonfinite",
+            update="eta", quantity="density_gradient", role="current", site=i,
+            description="MALA current density/gradient is nonfinite",
         )
         updated, info = kernel(site_key, state, site_logdensity, epsilon**2 / 2)
         next_position = position.at[i].set(origin + L @ updated.position)
@@ -147,18 +150,21 @@ def collapsed_random_walk_sweep(
     chain driver; no target-level nonfinite-to-minus-infinity conversion occurs.
     """
 
-    def logdensity_fn(position):
+    def logdensity_fn(position, *, site=None, role="selected"):
         value = target.theta_only_collapsed(
             position, delta, sigma_y2, mu_theta, Sigma_theta, sigma_c2
         )
         # -inf is a legitimate zero-density proposal; NaN/+inf is not.
-        checkify.debug_check(~jnp.isnan(value) & ~jnp.isposinf(value),
-                             "Metropolis target evaluation produced NaN/+inf")
+        check_quantity(~jnp.isnan(value) & ~jnp.isposinf(value),
+                       update="eta", quantity="logdensity", site=site, role=role,
+                       criterion="not_nan_or_positive_infinity",
+                       description="Metropolis target evaluation produced NaN/+inf")
         return value
 
     kernel = random_walk.build_rmh()
-    initial_state = random_walk.init(eta, logdensity_fn)
-    checkify.debug_check(jnp.isfinite(initial_state.logdensity), "MH current density is nonfinite")
+    initial_state = random_walk.init(eta, lambda position: logdensity_fn(position, role="current"))
+    check_quantity(jnp.isfinite(initial_state.logdensity), update="eta", quantity="logdensity",
+                   role="current", description="MH current density is nonfinite")
     site_keys = jax.random.split(key, eta.shape[0])
 
     def step(state, inputs):
@@ -172,7 +178,7 @@ def collapsed_random_walk_sweep(
             return position.at[i].set(proposal_i)
 
         next_state, info = kernel(
-            site_key, state, logdensity_fn, proposal_generator
+            site_key, state, lambda position: logdensity_fn(position, site=i, role="proposal"), proposal_generator
         )
         return next_state, (info.acceptance_rate, info.is_accepted)
 
