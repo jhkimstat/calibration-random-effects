@@ -117,7 +117,8 @@ class CoefficientRefreshTest(unittest.TestCase):
         standardization = ThetaStandardization.from_library(library)
         F_s = np.array([[0.2, -0.4], [0.7, 0.1], [-0.3, 0.5]])
         gp = LibraryGP.from_data(
-            standardization.to_standardized(library), F_s, [0.8, 1.2]
+            standardization.to_standardized(library), F_s, [0.8, 1.2],
+            kernel="se",
         )
         prior = SpatialPrior.from_standardization(
             standardization, physical_center=[0.1, -0.2],
@@ -207,7 +208,8 @@ class CoefficientRefreshTest(unittest.TestCase):
                     refresh_field_coefficients(key, target, *state)
         # A numerical jitter cannot hide structural coincidence at the boundary.
         jittered = replace(target, gp=LibraryGP.from_data(
-            target.gp.theta_s_tilde, target.gp.F_s, target.gp.lambda_c, jitter=1e-8
+            target.gp.theta_s_tilde, target.gp.F_s, target.gp.lambda_c, jitter=1e-8,
+            kernel="se",
         ))
         with self.assertRaisesRegex(ValueError, "coincides"):
             refresh_field_coefficients(

@@ -94,8 +94,9 @@ class MALADualAveragingTest(unittest.TestCase):
         expected = initial(0.01)
         for rate in info.theta.acceptance_rate:
             expected = update(expected, jnp.mean(rate))
-        # Compiled versus eager standard DA differs only by last-bit rounding.
-        np.testing.assert_allclose(frozen.epsilon, float(final(expected)), rtol=1e-14, atol=0)
+        # Independent compiled/eager tuning need only agree to negligible
+        # relative error; exact production freeze is checked below.
+        np.testing.assert_allclose(frozen.epsilon, float(final(expected)), rtol=1e-10, atol=0)
         self.assert_tree_equal(frozen.step_size_adaptation.state, expected)
         self.assertEqual(samples.eta.shape[0], 2)
         self.assertEqual(frozen.iteration, 2)

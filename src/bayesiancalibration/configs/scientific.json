@@ -125,6 +125,7 @@
     "maxiter": 1000,
     "log_bounds": null,
     "jitter": 0.0,
-    "method": "profile"
+    "method": "profile",
+    "kernel": "matern32"
   }
 }

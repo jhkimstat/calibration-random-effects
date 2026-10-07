@@ -9,6 +9,8 @@ jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 import numpy as np
 from scipy.optimize import minimize_scalar
+from scipy.spatial.distance import cdist
+from scipy.special import gamma, kv
 from scipy.stats import multivariate_normal
 
 from bayesiancalibration.gp import (
@@ -20,12 +22,18 @@ from bayesiancalibration.gp import (
 )
 
 
-def _numpy_kernel(a: np.ndarray, b: np.ndarray, length: np.ndarray) -> np.ndarray:
-    """Independent NumPy reference for the source-note covariance."""
-
-    return np.exp(
-        -0.5 * np.sum(((a[:, None, :] - b[None, :, :]) / length) ** 2, axis=2)
-    )
+def _numpy_kernel(a: np.ndarray, b: np.ndarray, length: np.ndarray,
+                  kernel: str = "se") -> np.ndarray:
+    """Independent distance/Bessel reference, rather than project closed forms."""
+    r = cdist(np.asarray(a) / length, np.asarray(b) / length)
+    if kernel == "se":
+        return np.exp(-0.5 * r**2)
+    nu = {"matern32": 1.5, "matern52": 2.5}[kernel]
+    z = np.sqrt(2 * nu) * r
+    result = np.ones_like(r)
+    nonzero = z != 0
+    result[nonzero] = 2**(1-nu) / gamma(nu) * z[nonzero]**nu * kv(nu, z[nonzero])
+    return result
 
 
 class LibraryConditioningTest(unittest.TestCase):
@@ -35,7 +43,7 @@ class LibraryConditioningTest(unittest.TestCase):
         self.F_s = np.array([[0.2, -0.4], [0.7, 0.1], [-0.3, 0.5]])
         self.lambda_c = np.array([0.8, 1.2])
         self.sigma_c2 = np.array([0.4, 1.7])
-        self.gp = LibraryGP.from_data(self.theta_s, self.F_s, self.lambda_c)
+        self.gp = LibraryGP.from_data(self.theta_s, self.F_s, self.lambda_c, kernel="se")
 
     def test_dense_joint_conditional_and_library_density(self) -> None:
         self.gp.validate_field_sites(self.theta_f)
@@ -85,7 +93,8 @@ class LibraryConditioningTest(unittest.TestCase):
         np.testing.assert_allclose(Sigma_2, 2.0 * Sigma_1)
 
         with_jitter = LibraryGP.from_data(
-            self.theta_s, self.F_s, self.lambda_c, jitter=1e-10
+            self.theta_s, self.F_s, self.lambda_c, jitter=1e-10,
+            kernel="se",
         )
         np.testing.assert_allclose(with_jitter.C_ss, self.gp.C_ss)
         m_j, C_j, _ = with_jitter.conditional_moments(self.theta_f, self.sigma_c2)
@@ -95,13 +104,14 @@ class LibraryConditioningTest(unittest.TestCase):
 
     def test_structural_singularity_is_not_hidden_by_jitter(self) -> None:
         with self.assertRaisesRegex(ValueError, "r >= 2"):
-            LibraryGP.from_data(self.theta_s[:1], self.F_s[:1], self.lambda_c)
+            LibraryGP.from_data(self.theta_s[:1], self.F_s[:1], self.lambda_c, kernel="se")
         with self.assertRaisesRegex(ValueError, "Repeated library"):
             LibraryGP.from_data(
                 np.vstack([self.theta_s, self.theta_s[0]]),
                 np.vstack([self.F_s, self.F_s[0]]),
                 self.lambda_c,
                 jitter=1e-6,
+                kernel="se",
             )
         with self.assertRaisesRegex(ValueError, "coincides"):
             self.gp.validate_field_sites(self.theta_s[:1])
@@ -113,6 +123,7 @@ class LibraryConditioningTest(unittest.TestCase):
                 self.F_s,
                 np.array([1.0]),
                 jitter=1e-6,
+                kernel="se",
             )
 
 
@@ -129,7 +140,7 @@ class ProfileFittingTest(unittest.TestCase):
         C_ss = _numpy_kernel(self.theta_s, self.theta_s, lambda_c)
         q = np.sum(self.F_s * np.linalg.solve(C_ss, self.F_s), axis=0)
         sigma_c2_hat = q / self.theta_s.shape[0]
-        profile = profile_log_likelihood(xi, self.theta_s, self.F_s)
+        profile = profile_log_likelihood(xi, self.theta_s, self.F_s, kernel="se")
         full_likelihood = sum(
             multivariate_normal.logpdf(self.F_s[:, j], cov=sigma_c2_hat[j] * C_ss)
             for j in range(self.F_s.shape[1])
@@ -149,7 +160,7 @@ class ProfileFittingTest(unittest.TestCase):
         self.assertTrue(result.success)
         np.testing.assert_allclose(np.exp(result.x), sigma_c2_hat[0], rtol=1e-5)
 
-        loading_only = profile_log_likelihood(xi, self.theta_s, self.F_s[:, :3])
+        loading_only = profile_log_likelihood(xi, self.theta_s, self.F_s[:, :3], kernel="se")
         loading_reference = sum(
             multivariate_normal.logpdf(self.F_s[:, j], cov=sigma_c2_hat[j] * C_ss)
             for j in range(3)
@@ -162,7 +173,7 @@ class ProfileFittingTest(unittest.TestCase):
     def test_log_length_gradient_and_fit_diagnostics(self) -> None:
         theta_2d = np.column_stack([self.theta_s[:, 0], np.sin(self.theta_s[:, 0])])
         xi = jnp.array([-0.3, 0.1])
-        objective = lambda x: profile_log_likelihood(x, theta_2d, self.F_s)
+        objective = lambda x: profile_log_likelihood(x, theta_2d, self.F_s, kernel="se")
         gradient = jax.jit(jax.grad(objective))(xi)
         h = 1e-5
         finite_difference = np.array([
@@ -176,19 +187,20 @@ class ProfileFittingTest(unittest.TestCase):
             self.theta_s, self.F_s,
             starts=np.array([[-1.0], [0.2]]),
             gtol=1e-6, ftol=1e-10, maxiter=300,
+            kernel="se",
         )
         self.assertTrue(all(attempt.success for attempt in fit.attempts))
         self.assertEqual(len(fit.attempts), 2)
         np.testing.assert_allclose(fit.lambda_c, [0.85612091], rtol=1e-5)
         self.assertGreater(
             fit.objective,
-            float(profile_log_likelihood(jnp.array([-1.0]), self.theta_s, self.F_s)),
+            float(profile_log_likelihood(jnp.array([-1.0]), self.theta_s, self.F_s, kernel="se")),
         )
         self.assertTrue(bool(jnp.all(fit.profiled_variances > 0)))
         self.assertEqual(fit.gtol, 1e-6)
         self.assertEqual(fit.maxiter, 300)
 
-        gp = LibraryGP.from_data(self.theta_s, self.F_s, fit.lambda_c)
+        gp = LibraryGP.from_data(self.theta_s, self.F_s, fit.lambda_c, kernel="se")
         m_1, C_1, Sigma_1 = gp.conditional_moments(jnp.array([[-0.9]]),
                                                     jnp.ones(6))
         m_2, C_2, Sigma_2 = gp.conditional_moments(jnp.array([[-0.9]]),
@@ -202,17 +214,20 @@ class ProfileFittingTest(unittest.TestCase):
             fit_library_length_scales(
                 self.theta_s, np.zeros_like(self.F_s),
                 starts=np.array([[0.0]]), gtol=1e-6, ftol=1e-9, maxiter=100,
+                kernel="se",
             )
         with self.assertRaisesRegex(ValueError, "starts"):
             fit_library_length_scales(
                 self.theta_s, self.F_s,
                 starts=np.array([]), gtol=1e-6, ftol=1e-9, maxiter=100,
+                kernel="se",
             )
         with self.assertRaisesRegex(ValueError, "singular"):
             fit_library_length_scales(
                 self.theta_s, self.F_s,
                 starts=np.array([[10.0]]), gtol=1e-6, ftol=1e-9,
                 maxiter=100, jitter=1e-6,
+                kernel="se",
             )
 
 
@@ -247,15 +262,15 @@ class CrossValidationFittingTest(unittest.TestCase):
                 np.sum((self.F_s[j] - c_hat) ** 2 / np.diag(C_pred))
             )
         np.testing.assert_allclose(
-            cv_nlpd(log_lambda_c, self.theta_s, self.F_s),
+            cv_nlpd(log_lambda_c, self.theta_s, self.F_s, kernel="se"),
             np.mean(reference), rtol=1e-12, atol=1e-12,
         )
         np.testing.assert_allclose(
-            cv_wmse(log_lambda_c, self.theta_s, self.F_s),
+            cv_wmse(log_lambda_c, self.theta_s, self.F_s, kernel="se"),
             np.mean(reference_wmse), rtol=1e-12, atol=1e-12,
         )
 
-        objective = lambda xi: cv_nlpd(xi, self.theta_s, self.F_s)
+        objective = lambda xi: cv_nlpd(xi, self.theta_s, self.F_s, kernel="se")
         gradient = jax.jit(jax.grad(objective))(jnp.asarray(log_lambda_c))
         h = 1e-5
         finite_difference = np.array([
@@ -265,7 +280,7 @@ class CrossValidationFittingTest(unittest.TestCase):
         ])
         np.testing.assert_allclose(gradient, finite_difference, rtol=1e-6, atol=1e-6)
 
-        wmse_objective = lambda xi: cv_wmse(xi, self.theta_s, self.F_s)
+        wmse_objective = lambda xi: cv_wmse(xi, self.theta_s, self.F_s, kernel="se")
         wmse_gradient = jax.jit(jax.grad(wmse_objective))(jnp.asarray(log_lambda_c))
         wmse_difference = np.array([
             (float(wmse_objective(log_lambda_c + h * np.eye(2)[q]))
@@ -280,32 +295,35 @@ class CrossValidationFittingTest(unittest.TestCase):
         fit = fit_library_length_scales(
             self.theta_s, self.F_s, starts=starts,
             gtol=1e-6, ftol=1e-10, maxiter=300, method="cv_nlpd",
+            kernel="se",
         )
         self.assertEqual(fit.method, "cv_nlpd")
         self.assertTrue(any(a.success for a in fit.attempts))
         self.assertLessEqual(fit.objective, min(
-            float(cv_nlpd(start, self.theta_s, self.F_s)) for start in starts
+            float(cv_nlpd(start, self.theta_s, self.F_s, kernel="se")) for start in starts
         ))
         np.testing.assert_allclose(
-            fit.objective, cv_nlpd(fit.log_lambda_c, self.theta_s, self.F_s)
+            fit.objective, cv_nlpd(fit.log_lambda_c, self.theta_s, self.F_s, kernel="se")
         )
         self.assertTrue(np.all(np.asarray(fit.profiled_variances) > 0))
         wmse_fit = fit_library_length_scales(
             self.theta_s, self.F_s, starts=starts,
             gtol=1e-6, ftol=1e-10, maxiter=300, method="cv_wmse",
+            kernel="se",
         )
         self.assertEqual(wmse_fit.method, "cv_wmse")
         self.assertLessEqual(wmse_fit.objective, min(
-            float(cv_wmse(start, self.theta_s, self.F_s)) for start in starts
+            float(cv_wmse(start, self.theta_s, self.F_s, kernel="se")) for start in starts
         ))
         np.testing.assert_allclose(
             wmse_fit.objective,
-            cv_wmse(wmse_fit.log_lambda_c, self.theta_s, self.F_s),
+            cv_wmse(wmse_fit.log_lambda_c, self.theta_s, self.F_s, kernel="se"),
         )
         with self.assertRaisesRegex(ValueError, "method"):
             fit_library_length_scales(
                 self.theta_s, self.F_s, starts=starts, gtol=1e-6,
                 ftol=1e-10, maxiter=100, method="invalid",
+                kernel="se",
             )
         one_nonzero_row = np.zeros_like(self.F_s)
         one_nonzero_row[0] = 1.0
@@ -313,6 +331,7 @@ class CrossValidationFittingTest(unittest.TestCase):
             fit_library_length_scales(
                 self.theta_s, one_nonzero_row, starts=starts[:1],
                 gtol=1e-6, ftol=1e-10, maxiter=100, method="cv_nlpd",
+                kernel="se",
             )
 
 

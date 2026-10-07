@@ -176,7 +176,7 @@ class SpatialPrior:
         for name, matrix in (("V_theta_0", V), ("S_theta_0", S)):
             if matrix.shape != (d, d) or not np.all(np.isfinite(matrix)):
                 raise ValueError(f"{name} must be a finite (d, d) matrix")
-            if not np.allclose(matrix, matrix.T, rtol=0.0, atol=0.0):
+            if not np.allclose(matrix, matrix.T, rtol=1e-12, atol=1e-14):
                 raise ValueError(f"{name} must be symmetric")
             try:
                 np.linalg.cholesky(matrix)

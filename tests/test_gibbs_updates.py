@@ -55,6 +55,7 @@ class GibbsFixture(unittest.TestCase):
         gp = LibraryGP.from_data(
             standardization.to_standardized(library),
             rng.normal(scale=0.3, size=(4, k)), [0.8, 1.2],
+            kernel="se",
         )
         prior = SpatialPrior.from_standardization(
             standardization, physical_center=[0.1, -0.2],
@@ -601,7 +602,8 @@ class CoefficientVarianceTest(GibbsFixture):
         np.testing.assert_array_equal(np.delete(old_scale, 2), np.delete(new_scale, 2))
         self.assertNotEqual(float(old_scale[2]), float(new_scale[2]))
         rebuilt_gp = LibraryGP.from_data(
-            target.gp.theta_s_tilde, target.gp.F_s + 0.15, target.gp.lambda_c
+            target.gp.theta_s_tilde, target.gp.F_s + 0.15, target.gp.lambda_c,
+            kernel="se",
         )
         rebuilt = replace(target, gp=rebuilt_gp)
         theta = rebuilt.coordinates.eta_to_theta_tilde(self.eta)
@@ -616,7 +618,8 @@ class CoefficientVarianceTest(GibbsFixture):
     def test_positive_fixed_jitter_matches_factor_based_joint(self) -> None:
         target = self.target()
         jittered_gp = LibraryGP.from_data(
-            target.gp.theta_s_tilde, target.gp.F_s, target.gp.lambda_c, jitter=1e-6
+            target.gp.theta_s_tilde, target.gp.F_s, target.gp.lambda_c, jitter=1e-6,
+            kernel="se",
         )
         target = replace(target, gp=jittered_gp)
         c_f, delta, noise, sigma_c2 = self.state(target)
@@ -655,7 +658,8 @@ class CoefficientVarianceTest(GibbsFixture):
                 key, target, self.eta, jnp.full(c_f.shape, 1e200)
             )
         jittered = replace(target, gp=LibraryGP.from_data(
-            target.gp.theta_s_tilde, target.gp.F_s, target.gp.lambda_c, jitter=1e-6
+            target.gp.theta_s_tilde, target.gp.F_s, target.gp.lambda_c, jitter=1e-6,
+            kernel="se",
         ))
         with self.assertRaisesRegex(ValueError, "coincides"):
             update_coefficient_variances(

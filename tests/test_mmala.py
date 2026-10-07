@@ -17,6 +17,7 @@ from bayesiancalibration.samplers.mmala import (
 )
 import test_random_walk as theta_reference
 import test_nuts as posterior_reference
+from test_gp import _numpy_kernel
 
 
 def reference_conditional(target, eta, i, inputs):
@@ -29,7 +30,7 @@ def reference_conditional(target, eta, i, inputs):
             target.coordinates.u_tilde-target.coordinates.l_tilde
         ) * expit(theta)
     library, length = np.asarray(target.gp.theta_s_tilde), np.asarray(target.gp.lambda_c)
-    kernel = lambda a, b: np.exp(-.5*np.sum(((a[:, None]-b[None, :])/length)**2, axis=-1))
+    kernel = lambda a, b: _numpy_kernel(a, b, length, kernel=target.gp.kernel)
     ss, fs, ff = kernel(library, library), kernel(theta, library), kernel(theta, theta)
     m = (fs @ np.linalg.solve(ss, target.gp.F_s)).reshape(-1)
     C = ff - fs @ np.linalg.solve(ss, fs.T)

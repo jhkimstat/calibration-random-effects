@@ -24,7 +24,7 @@ class CalibrationTargetTest(unittest.TestCase):
         self.standardization = ThetaStandardization.from_library(library_physical)
         theta_s_tilde = self.standardization.to_standardized(library_physical)
         self.F_s = np.array([[0.2, -0.4], [0.7, 0.1], [-0.3, 0.5]])
-        self.gp = LibraryGP.from_data(theta_s_tilde, self.F_s, [0.8, 1.2])
+        self.gp = LibraryGP.from_data(theta_s_tilde, self.F_s, [0.8, 1.2], kernel="se")
         self.prior = SpatialPrior.from_standardization(
             self.standardization,
             physical_center=[0.1, -0.2],

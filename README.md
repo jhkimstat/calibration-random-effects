@@ -69,6 +69,16 @@ The stacking convention is **site/run first, then active branch, then coefficien
 
 Library sample mean and sample standard deviation (divisor `r-1`) are frozen before fitting. The default profile fit uses three log-length-scale starts `[-1,-1,-1]`, `[0,0,0]`, `[1,1,1]`, `gtol=1e-6`, `ftol=1e-10`, and `maxiter=1000`. `cv_nlpd` and `cv_wmse` remain available. The default has no GP nugget/jitter, no fitted input bounds, and inferred coefficient variances. The prepared archive records the selected length scales, standardization, scientific settings, fit diagnostics, provenance, and environment.
 
+The coefficient GP kernel is selected by `library_fit.kernel`: `se`, `matern32` (the default), or `matern52`. Each has unit amplitude, with sampled `sigma_c2` carrying output variance. All use the standardized ARD distance `r = sqrt(sum_q((x_q-x'_q)/lambda_c[q])^2)`. SE is `exp(-r²/2)`; Matérn 3/2 is `(1+sqrt(3)r)exp(-sqrt(3)r)`; Matérn 5/2 is `(1+sqrt(5)r+5r²/3)exp(-sqrt(5)r)`. These are radial kernels using anisotropic length scales, following the [standard Matérn convention](https://scikit-learn.org/stable/modules/generated/sklearn.gaussian_process.kernels.Matern.html). The spatial GP `K_theta` retains its SE kernel and fixed range 12.
+
+An explicit preparation flag overrides the scientific file's coefficient kernel:
+
+```sh
+bayesiancalibration prepare --input inputs.npz --output prepared-matern52.npz --kernel matern52
+```
+
+Without `--kernel`, the file selection is preserved; an omitted `library_fit.kernel` defaults to `matern32` during fresh preparation. The selected kernel is used consistently for profile/CV fitting, library factors, field conditioning and geometry checks, and is frozen in prepared metadata. Changing kernels requires fresh preparation and length-scale fitting. Prepared archives without an explicit fitted-kernel record must be prepared again; they are not interpreted using the new default. In the numerical API, pass `kernel="se"`, `kernel="matern32"`, or `kernel="matern52"` to `LibraryGP.from_data`, `fit_library_length_scales`, and the fitting objectives; `squared_exponential_kernel` remains explicitly SE.
+
 ## Sampler files and CLI overrides
 
 Run controls belong to the CLI: paths, method, seed, chain count, warmup and production lengths, batch size, diagnostic mode, and sampler-file selection. Sampler files contain only settings applicable to their method. Packaged files provide the defaults:

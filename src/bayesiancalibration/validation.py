@@ -55,11 +55,15 @@ def validate_key(key):
 
 
 def validate_spd(value, shape, name):
-    """Normalize a declared symmetric positive-definite float64 array."""
+    """Check a float64 SPD array, allowing negligible symmetry roundoff.
+
+    The tolerance matches NUTS mass validation; validation leaves entries
+    unchanged rather than requiring or enforcing bitwise symmetry.
+    """
     matrix = np.asarray(value, dtype=np.float64)
     if matrix.shape != shape or not np.all(np.isfinite(matrix)):
         raise ValueError(f"{name} must be finite with shape {shape}")
-    if not np.array_equal(matrix, np.swapaxes(matrix, -1, -2)):
+    if not np.allclose(matrix, np.swapaxes(matrix, -1, -2), rtol=1e-12, atol=1e-14):
         raise ValueError(f"{name} must be symmetric")
     try:
         np.linalg.cholesky(matrix)

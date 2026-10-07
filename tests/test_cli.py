@@ -40,6 +40,46 @@ def fresh_fixture(directory: Path):
 
 
 class ConfigurationTest(unittest.TestCase):
+    def test_kernel_defaults_file_preservation_override_and_prepared_record(self):
+        self.assertEqual(experiment.default_config("scientific")["library_fit"]["kernel"], "matern32")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source, science, _, config = fresh_fixture(root)
+            config["library_fit"]["kernel"] = "matern52"
+            science.write_text(json.dumps(config))
+            for override, expected in ((None, "matern52"), ("matern32", "matern32"), ("se", "se")):
+                prepared = root / f"{expected}.npz"
+                args = ["prepare", "--input", str(source), "--scientific-config", str(science),
+                        "--output", str(prepared)]
+                cli.main(args + (["--kernel", override] if override else []))
+                target, _, details = experiment.load_experiment(prepared)
+                self.assertEqual(target.gp.kernel, expected)
+                self.assertEqual(details["fit"]["kernel"], expected)
+                self.assertEqual(details["scientific_config"]["library_fit"]["kernel"], expected)
+                np.testing.assert_allclose(target.C_theta[0,1], np.exp(-.125))
+            # Missing input selection defaults only during fresh preparation.
+            del config["library_fit"]["kernel"]
+            prepared = root / "implicit-default.npz"
+            experiment.prepare_experiment(source, config, prepared)
+            target, _, details = experiment.load_experiment(prepared)
+            self.assertEqual(target.gp.kernel, "matern32")
+            with np.load(prepared, allow_pickle=False) as archive:
+                arrays = {name: archive[name] for name in archive.files}
+            del details["scientific_config"]["library_fit"]["kernel"]
+            arrays["metadata"] = np.asarray(json.dumps(details))
+            ambiguous = root / "unspecified-kernel.npz"
+            np.savez(ambiguous, **arrays)
+            with self.assertRaisesRegex(ValueError, "lack a coefficient kernel"):
+                experiment.load_experiment(ambiguous)
+            details["scientific_config"]["library_fit"]["kernel"] = "se"
+            arrays["metadata"] = np.asarray(json.dumps(details))
+            np.savez(ambiguous, **arrays)
+            with self.assertRaisesRegex(ValueError, "different coefficient kernels"):
+                experiment.load_experiment(ambiguous)
+            config["library_fit"]["kernel"] = "invalid"
+            with self.assertRaisesRegex(ValueError, "library_fit.kernel"):
+                experiment.validate_scientific_config(config)
+
     def test_library_fit_methods_and_unknown_science_fields(self):
         config = experiment.default_config("scientific")
         for method in ("profile", "cv_nlpd", "cv_wmse"):
@@ -159,41 +199,42 @@ class FreshExperimentTest(unittest.TestCase):
                 np.testing.assert_array_equal(a, b)
 
     def test_actual_cli_fit_warmup_and_retained_draws_all_methods(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            source, science, _, _ = fresh_fixture(root)
-            prepared = root / "fixed.npz"
-            cli.main(["prepare", "--input", str(source), "--scientific-config", str(science),
-                      "--output", str(prepared)])
-            config_dir = root / "samplers"
-            config_dir.mkdir()
-            for method in experiment.METHODS:
-                settings = experiment.resolve_sampler_settings(method)
-                if method in ("mh", "mala"):
-                    settings.update(num_initial=1, initial_proposal_variance=.001)
-                if method in ("mala", "mmala"):
-                    settings["epsilon"] = .01
-                if method in ("nuts", "collapsed_nuts"):
-                    settings.update(initial_step_size=.01, max_num_doublings=1)
-                (config_dir / (method + ".json")).write_text(json.dumps(settings))
-            output = root / "results"
-            cli.main(["run", "--prepared", str(prepared), "--output", str(output), "--method", "all",
-                      "--chains", "1", "--seed", "77", "--num-warmup", "4", "--num-samples", "2",
-                      "--batch-size", "2", "--sampler-config", str(config_dir)])
-            resolved = json.loads((output / "experiment.json").read_text())
-            self.assertEqual(resolved["run"]["num_samples"], 2)
-            for method in experiment.METHODS:
-                directory = output / method / "chain-0"
-                self.assertFalse((directory / "checkpoint.npz").exists())
-                with np.load(next(directory.glob("draws-*.npz")), allow_pickle=False) as draws:
-                    self.assertEqual(draws["state.eta"].shape, (2, 2, 2))
-                    self.assertEqual(draws["sweep"].tolist(), [5, 6])
-                    self.assertTrue(np.all(np.isfinite(draws["full_joint_logdensity"])))
-                    self.assertFalse(any("key" in name or "adaptation" in name for name in draws))
-                analysis = json.loads((output / method / "analysis.json").read_text())
-                self.assertEqual(analysis["status"], "too_short_for_chain_diagnostics")
-            with self.assertRaises(FileExistsError):
-                cli.main(["run", "--prepared", str(prepared), "--output", str(output), "--method", "nuts"])
+        for kernel in ("matern32", "matern52"):
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                source, science, _, _ = fresh_fixture(root)
+                prepared = root / "fixed.npz"
+                cli.main(["prepare", "--input", str(source), "--scientific-config", str(science),
+                          "--output", str(prepared), "--kernel", kernel])
+                config_dir = root / "samplers"
+                config_dir.mkdir()
+                for method in experiment.METHODS:
+                    settings = experiment.resolve_sampler_settings(method)
+                    if method in ("mh", "mala"):
+                        settings.update(num_initial=1, initial_proposal_variance=.001)
+                    if method in ("mala", "mmala"):
+                        settings["epsilon"] = .01
+                    if method in ("nuts", "collapsed_nuts"):
+                        settings.update(initial_step_size=.01, max_num_doublings=1)
+                    (config_dir / (method + ".json")).write_text(json.dumps(settings))
+                output = root / "results"
+                cli.main(["run", "--prepared", str(prepared), "--output", str(output), "--method", "all",
+                          "--chains", "1", "--seed", "77", "--num-warmup", "4", "--num-samples", "2",
+                          "--batch-size", "2", "--sampler-config", str(config_dir)])
+                resolved = json.loads((output / "experiment.json").read_text())
+                self.assertEqual(resolved["run"]["num_samples"], 2)
+                for method in experiment.METHODS:
+                    directory = output / method / "chain-0"
+                    self.assertFalse((directory / "checkpoint.npz").exists())
+                    with np.load(next(directory.glob("draws-*.npz")), allow_pickle=False) as draws:
+                        self.assertEqual(draws["state.eta"].shape, (2, 2, 2))
+                        self.assertEqual(draws["sweep"].tolist(), [5, 6])
+                        self.assertTrue(np.all(np.isfinite(draws["full_joint_logdensity"])))
+                        self.assertFalse(any("key" in name or "adaptation" in name for name in draws))
+                    analysis = json.loads((output / method / "analysis.json").read_text())
+                    self.assertEqual(analysis["status"], "too_short_for_chain_diagnostics")
+                with self.assertRaises(FileExistsError):
+                    cli.main(["run", "--prepared", str(prepared), "--output", str(output), "--method", "nuts"])
 
     def test_explicit_cli_overrides_are_recorded_and_used_in_sampling(self):
         with tempfile.TemporaryDirectory() as tmp:

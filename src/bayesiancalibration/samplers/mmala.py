@@ -45,7 +45,7 @@ def site_observation_conditional_moments(
     L_o = jnp.linalg.cholesky(V_y[jnp.ix_(other, other)])
     m_cond = m_i + V_io @ jsp.linalg.cho_solve((L_o, True), target.y_tilde[other]-m_y[other])
     V_cond = V_ii - V_io @ jsp.linalg.cho_solve((L_o, True), V_io.T)
-    return m_cond, (V_cond + V_cond.T) / 2
+    return m_cond, V_cond
 
 
 def collapsed_mmala_metric(
@@ -94,7 +94,7 @@ def collapsed_mmala_metric(
     L_prior = jnp.linalg.cholesky(conditional_scale * Sigma_theta)
     G = (fisher + D @ jsp.linalg.cho_solve((L_prior, True), D)
          + jnp.diag(curvature) + epsilon_G * jnp.eye(d, dtype=jnp.float64))
-    return (G + G.T) / 2
+    return G
 
 
 def mmala_proposal_moments(
@@ -134,7 +134,7 @@ def mmala_proposal_moments(
         check_quantity(valid | current_origin, update="eta", quantity="gradient_metric_diffusion",
                        role="proposal", site=i, criterion="finite_positive_diffusion",
                        description="MMALA gradient/metric/diffusion is invalid")
-    return mean, (covariance + covariance.T) / 2
+    return mean, covariance
 
 
 def collapsed_mmala_sweep(

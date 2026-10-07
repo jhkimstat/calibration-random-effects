@@ -39,6 +39,7 @@ class DiscrepancyUpdateTest(unittest.TestCase):
         gp = LibraryGP.from_data(
             standardization.to_standardized(library),
             rng.normal(scale=0.3, size=(4, k)), [0.8, 1.2],
+            kernel="se",
         )
         spatial_prior = SpatialPrior.from_standardization(
             standardization, physical_center=[0.1, -0.2],

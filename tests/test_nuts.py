@@ -45,7 +45,7 @@ def scalar_posterior_start(bounded, count=12000):
     standardization = ThetaStandardization.from_library(library)
     xs = np.asarray(standardization.to_standardized(library))[:, 0]
     F_s = np.array([[-0.55], [0.2], [1.2]])
-    gp = LibraryGP.from_data(xs[:, None], F_s, [0.65])
+    gp = LibraryGP.from_data(xs[:, None], F_s, [0.65], kernel="se")
     coordinates = SiteCoordinates.from_physical_bounds(
         standardization, **({"l": [-1.5], "u": [1.6]} if bounded else {})
     )

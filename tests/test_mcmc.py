@@ -45,6 +45,7 @@ def make_fixture(bounded=False, loading_only=False):
         standardization.to_standardized(library),
         np.array([[0.2, -0.4], [0.7, 0.1], [-0.3, 0.5], [0.1, 0.3]])[:, :k],
         [0.8, 1.2],
+        kernel="se",
     )
     prior = SpatialPrior.from_standardization(
         standardization, physical_center=[0.1, -0.2], V_theta_0=np.eye(2),
@@ -207,7 +208,7 @@ class JointStationarityTest(unittest.TestCase):
         standardization = ThetaStandardization.from_library(library)
         theta_s = np.asarray(standardization.to_standardized(library))[:, 0]
         F_s = np.array([[-0.55], [0.2], [1.2]])
-        gp = LibraryGP.from_data(theta_s[:, None], F_s, [0.65])
+        gp = LibraryGP.from_data(theta_s[:, None], F_s, [0.65], kernel="se")
         prior = SpatialPrior.from_standardization(
             standardization, physical_center=[0.2], V_theta_0=[[0.25]],
             nu_theta_0=8.0, S_theta_0=[[1.5]],

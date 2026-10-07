@@ -23,9 +23,25 @@ from bayesiancalibration.mcmc import (
     validate_random_walk_chain,
 )
 import test_mcmc as reference
+from bayesiancalibration.validation import validate_spd
 
 
 class CovarianceAdaptationTest(unittest.TestCase):
+    def test_negligible_asymmetry_is_accepted_without_repair(self):
+        matrix = np.array([[1., .2], [.2+5e-15, 1.]])
+        np.testing.assert_array_equal(validate_spd(matrix, (2,2), "covariance"), matrix)
+        proposals = np.tile(matrix, (2,1,1))
+        adaptation = initialize_random_walk_adaptation(4, 1, proposals)
+        np.testing.assert_array_equal(adaptation.initial_V_prop, proposals)
+        validate_random_walk_adaptation(adaptation, 2, 2)
+        target, state, _ = reference.make_fixture()
+        chain = initialize_random_walk_warmup(
+            target, state, jax.random.key(951), num_warmup=4, num_initial=1, V_prop=proposals)
+        np.testing.assert_array_equal(chain.V_prop, proposals)
+        for invalid in (matrix+np.array([[0., .01], [0., 0.]]), -np.eye(2)):
+            with self.assertRaises(ValueError):
+                validate_spd(invalid, (2,2), "covariance")
+
     def test_online_moments_and_note_regularizer_match_numpy(self):
         rng = np.random.default_rng(950)
         history = rng.normal(size=(20, 2, 3)) + np.array([1e6, -2e6, 3e6])

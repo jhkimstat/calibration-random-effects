@@ -20,7 +20,7 @@ import numpy as np
 
 from bayesiancalibration import mcmc
 from bayesiancalibration.gibbs import refresh_field_coefficients
-from bayesiancalibration.gp import LibraryGP, fit_library_length_scales
+from bayesiancalibration.gp import COEFFICIENT_KERNELS, LibraryGP, fit_library_length_scales
 from bayesiancalibration.samplers.nuts import nuts_blocks
 from bayesiancalibration.state import CalibrationState, SpatialPrior, ThetaStandardization
 from bayesiancalibration.targets import CalibrationTarget
@@ -94,11 +94,13 @@ def validate_scientific_config(config: dict) -> None:
     bounded = model["site_support"] == "bounded"
     if bounded != ({"l", "u"} <= set(model)) or (not bounded and ({"l", "u"} & set(model))):
         raise ValueError("Bounded sites require both physical l and u; unbounded sites omit them")
-    fit_fields = {"method", "starts", "gtol", "ftol", "maxiter", "log_bounds", "jitter"}
-    if not isinstance(fit, dict) or set(fit) - fit_fields or not (fit_fields - {"method"}) <= set(fit):
+    fit_fields = {"method", "kernel", "starts", "gtol", "ftol", "maxiter", "log_bounds", "jitter"}
+    if not isinstance(fit, dict) or set(fit) - fit_fields or not (fit_fields - {"method", "kernel"}) <= set(fit):
         raise ValueError("Unknown or missing library_fit settings")
     if fit.get("method", "profile") not in ("profile", "cv_nlpd", "cv_wmse"):
         raise ValueError("library_fit.method must be profile, cv_nlpd, or cv_wmse")
+    if fit.get("kernel", "matern32") not in COEFFICIENT_KERNELS:
+        raise ValueError("library_fit.kernel must be se, matern32, or matern52")
 
 
 def resolve_sampler_settings(method: str, config_path: Path | None = None,
@@ -179,6 +181,7 @@ def build_target(arrays: dict, config: dict) -> CalibrationTarget:
     gp = LibraryGP.from_data(
         standardization.to_standardized(arrays["theta_s_dagger"]), arrays["F_s"],
         arrays["lambda_c"], jitter=config["library_fit"]["jitter"],
+        kernel=config["library_fit"].get("kernel", "matern32"),
     )
     prior = SpatialPrior.from_standardization(standardization, **{
         name: model[name] for name in
@@ -202,7 +205,7 @@ def prepare_experiment(preprocessing: Path, scientific_config: dict, output: Pat
     validate_scientific_config(scientific_config)
     scientific_config = {
         "model": scientific_config["model"],
-        "library_fit": {"method": "profile", **scientific_config["library_fit"]},
+        "library_fit": {"method": "profile", "kernel": "matern32", **scientific_config["library_fit"]},
     }
     with np.load(preprocessing, allow_pickle=False) as source:
         arrays = {name: np.asarray(source[name], dtype=np.float64) for name in PREPARED_FIELDS}
@@ -241,6 +244,11 @@ def load_experiment(path: Path) -> tuple[CalibrationTarget, dict, dict]:
     with np.load(path, allow_pickle=False) as archive:
         arrays = {name: archive[name] for name in (*PREPARED_FIELDS, "lambda_c")}
         details = json.loads(str(archive["metadata"].item()))
+    if ("kernel" not in details["scientific_config"]["library_fit"]
+        or "kernel" not in details["fit"]):
+        raise ValueError("Prepared inputs lack a coefficient kernel; prepare again with an explicit kernel")
+    if details["fit"]["kernel"] != details["scientific_config"]["library_fit"]["kernel"]:
+        raise ValueError("Prepared fit and scientific configuration specify different coefficient kernels")
     return build_target(arrays, details["scientific_config"]), arrays, details
 
 

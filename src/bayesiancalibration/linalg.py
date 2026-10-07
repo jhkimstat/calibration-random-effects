@@ -19,6 +19,8 @@ Shared projected-model arguments:
         from the per-site noise covariance Sigma_y of shape (k, k).
 
 All other conditioning parameters are implicit in these supplied moments.
+Returned covariances are mathematically symmetric; standard JAX Cholesky
+consumers handle roundoff symmetry without repeated explicit averaging here.
 """
 
 from __future__ import annotations
@@ -44,7 +46,6 @@ def projected_marginal_moments(
 
     m_y = R @ (m_f_given_s + d_delta)
     V_y = R @ Sigma_f_given_s @ R.T + Omega_y
-    V_y = 0.5 * (V_y + V_y.T)
     return m_y, V_y
 
 
@@ -81,7 +82,6 @@ def projected_conditional_coefficient_moments(
     )
     m_f = m_f_given_s + Sigma_fy @ V_y_solve_residual
     V_f = Sigma_f_given_s - Sigma_fy @ V_y_solve_Sigma_yf
-    V_f = 0.5 * (V_f + V_f.T)
     return m_f, V_f
 
 

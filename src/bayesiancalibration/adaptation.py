@@ -388,7 +388,7 @@ def initialize_random_walk_adaptation(
         or not np.all(np.isfinite(proposal))
     ):
         raise ValueError("initial_V_prop must be finite with shape (n,d,d)")
-    if not np.array_equal(proposal, np.swapaxes(proposal, -1, -2)):
+    if not np.allclose(proposal, np.swapaxes(proposal, -1, -2), rtol=1e-12, atol=1e-14):
         raise ValueError("initial_V_prop must be symmetric")
     try:
         np.linalg.cholesky(proposal)
@@ -434,22 +434,15 @@ def update_random_walk_adaptation(
     # Store a symmetric covariance statistic; this removes only roundoff
     # asymmetry in Welford's outer product, without changing the estimator.
     M2 = 0.5 * (updated.m2 + jnp.swapaxes(updated.m2, -1, -2))
-    M2 = jnp.tril(M2) + jnp.swapaxes(jnp.tril(M2, -1), -1, -2)
     updated = updated._replace(m2=M2)
 
     def proposal_from_covariance(_):
         S_hat, _, _ = jax.vmap(_welford_final)(updated)
-        S_hat = 0.5 * (S_hat + jnp.swapaxes(S_hat, -1, -2))
         d = eta.shape[1]
         trace = jnp.trace(S_hat, axis1=-2, axis2=-1)
         P = S_hat + (trace / (1000.0 * d))[:, None, None] * jnp.eye(d)
         scale = 2.38**2 / d if proposal_scale is None else proposal_scale
         proposal = scale * P
-        # Mirror one triangle so compiled arithmetic cannot leave a tiny
-        # asymmetry at the host's exact covariance-symmetry boundary.
-        proposal = jnp.tril(proposal) + jnp.swapaxes(
-            jnp.tril(proposal, -1), -1, -2
-        )
         # Exactly zero scatter is an explicit tuning issue during warmup.
         # Do not use a tolerance or hold nonzero, indefinite/nonfinite estimates.
         zero = jnp.all(S_hat == 0, axis=(-2, -1))
@@ -492,7 +485,7 @@ def validate_random_walk_adaptation(
     if (
         initial.shape != (n, d, d) or initial.dtype != np.float64
         or not np.all(np.isfinite(initial))
-        or not np.array_equal(initial, np.swapaxes(initial, -1, -2))
+        or not np.allclose(initial, np.swapaxes(initial, -1, -2), rtol=1e-12, atol=1e-14)
     ):
         raise ValueError("initial_V_prop must be a finite symmetric float64 (n,d,d)")
     try:

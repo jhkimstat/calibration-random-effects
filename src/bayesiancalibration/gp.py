@@ -4,6 +4,8 @@ Inputs ``theta_s_tilde`` and ``theta_f_tilde`` are standardized rows of shapes
 (r, d) and (n, d). ``F_s`` is the fixed library coefficient view (r, k),
 with active branches concatenated within each row. No GP mean or statistical
 nugget is added. A supplied jitter is a fixed numerical factorization policy.
+The coefficient correlation is radial in the standardized ARD distance;
+``kernel`` selects ``se``, ``matern32`` (default), or ``matern52``.
 """
 
 from __future__ import annotations
@@ -19,6 +21,9 @@ from scipy import __version__ as scipy_version
 from scipy.optimize import minimize
 
 
+COEFFICIENT_KERNELS = ("se", "matern32", "matern52")
+
+
 def squared_exponential_kernel(
     theta_a_tilde: Array,
     theta_b_tilde: Array,
@@ -30,10 +35,42 @@ def squared_exponential_kernel(
     Input validation belongs to the preparation boundary, outside JIT.
     """
 
-    scaled_difference = (
-        theta_a_tilde[:, None, :] - theta_b_tilde[None, :, :]
-    ) / lambda_c
-    return jnp.exp(-0.5 * jnp.sum(jnp.square(scaled_difference), axis=-1))
+    return coefficient_kernel(theta_a_tilde, theta_b_tilde, lambda_c, kernel="se")
+
+
+def coefficient_kernel(
+    theta_a_tilde: Array,
+    theta_b_tilde: Array,
+    lambda_c: Array,
+    *,
+    kernel: str = "matern32",
+) -> Array:
+    """Unit-amplitude K_c with ARD scales (d,), returning an (a,b) matrix.
+
+    Inputs are standardized (a,d)/(b,d) rows. ``kernel`` is a fixed Python
+    string: close over it or mark it static when JIT compiling this function.
+    JAX has no Matérn primitive, so these closed forms use standard operations.
+    At exactly zero squared distance, the value and derivatives use the
+    analytic polynomial extension. This avoids sqrt(0) autodiff NaNs without
+    adding a distance floor/nugget or approximating any nonzero distance.
+    """
+    if kernel not in COEFFICIENT_KERNELS:
+        raise ValueError("kernel must be se, matern32, or matern52")
+    difference = (theta_a_tilde[:, None, :] - theta_b_tilde[None, :, :]) / lambda_c
+    r2 = jnp.sum(jnp.square(difference), axis=-1)
+    if kernel == "se":
+        return jnp.exp(-0.5 * r2)
+    nonzero = r2 != 0
+    r = jnp.sqrt(jnp.where(nonzero, r2, 1.0))
+    if kernel == "matern32":
+        z = jnp.sqrt(3.0) * r
+        value = (1.0 + z) * jnp.exp(-z)
+        at_zero = 1.0 - 1.5 * r2
+    else:
+        z = jnp.sqrt(5.0) * r
+        value = (1.0 + z + (5.0 / 3.0) * r2) * jnp.exp(-z)
+        at_zero = 1.0 - (5.0 / 6.0) * r2 + (25.0 / 24.0) * r2**2
+    return jnp.where(nonzero, value, at_zero)
 
 
 def _check_unjittered_covariance(C: np.ndarray, name: str) -> None:
@@ -80,11 +117,12 @@ def _library_factor(
     theta_s_tilde: np.ndarray,
     lambda_c: np.ndarray,
     jitter: float,
+    kernel: str,
 ) -> tuple[Array, Array]:
     """Check structural singularity, then factor at the fixed jitter."""
 
     theta = jnp.asarray(theta_s_tilde)
-    C_ss = squared_exponential_kernel(theta, theta, jnp.asarray(lambda_c))
+    C_ss = coefficient_kernel(theta, theta, jnp.asarray(lambda_c), kernel=kernel)
     _check_unjittered_covariance(np.asarray(C_ss), "C_ss")
     L_ss = jnp.linalg.cholesky(C_ss + jitter * jnp.eye(theta.shape[0]))
     if not bool(jnp.all(jnp.isfinite(L_ss))):
@@ -111,6 +149,7 @@ class LibraryGP:
     alpha_s: Array
     q_s: Array
     jitter: float
+    kernel: str = "matern32"
 
     @classmethod
     def from_data(
@@ -120,6 +159,7 @@ class LibraryGP:
         lambda_c: Array,
         *,
         jitter: float = 0.0,
+        kernel: str = "matern32",
     ) -> LibraryGP:
         """Build the exact library GP at supplied fixed length scales."""
 
@@ -129,14 +169,14 @@ class LibraryGP:
             raise ValueError("lambda_c must have shape (d,)")
         if not np.all(np.isfinite(lambda_np)) or np.any(lambda_np <= 0):
             raise ValueError("lambda_c must be finite and positive")
-        C_ss, L_ss = _library_factor(theta_np, lambda_np, jitter)
+        C_ss, L_ss = _library_factor(theta_np, lambda_np, jitter, kernel)
         F_jax = jnp.asarray(F_np)
         alpha_s = jsp.linalg.cho_solve((L_ss, True), F_jax)
         whitened = jsp.linalg.solve_triangular(L_ss, F_jax, lower=True)
         q_s = jnp.sum(jnp.square(whitened), axis=0)
         return cls(
             jnp.asarray(theta_np), F_jax, jnp.asarray(lambda_np),
-            C_ss, L_ss, alpha_s, q_s, float(jitter),
+            C_ss, L_ss, alpha_s, q_s, float(jitter), kernel,
         )
 
     def validate_field_sites(self, theta_f_tilde: Array) -> None:
@@ -160,11 +200,11 @@ class LibraryGP:
         )):
             raise ValueError("Field site coincides with a library input")
 
-        C_fs = np.asarray(squared_exponential_kernel(
-            jnp.asarray(theta_f), self.theta_s_tilde, self.lambda_c
+        C_fs = np.asarray(coefficient_kernel(
+            jnp.asarray(theta_f), self.theta_s_tilde, self.lambda_c, kernel=self.kernel
         ))
-        C_ff = np.asarray(squared_exponential_kernel(
-            jnp.asarray(theta_f), jnp.asarray(theta_f), self.lambda_c
+        C_ff = np.asarray(coefficient_kernel(
+            jnp.asarray(theta_f), jnp.asarray(theta_f), self.lambda_c, kernel=self.kernel
         ))
         C_f_given_s = C_ff - C_fs @ np.linalg.solve(np.asarray(self.C_ss), C_fs.T)
         C_f_given_s = 0.5 * (C_f_given_s + C_f_given_s.T)
@@ -182,11 +222,11 @@ class LibraryGP:
         sigma_c2 changes. Site-major/branch-within-site stacking uses row-major view.
         """
 
-        C_fs = squared_exponential_kernel(
-            theta_f_tilde, self.theta_s_tilde, self.lambda_c
+        C_fs = coefficient_kernel(
+            theta_f_tilde, self.theta_s_tilde, self.lambda_c, kernel=self.kernel
         )
-        C_ff = squared_exponential_kernel(
-            theta_f_tilde, theta_f_tilde, self.lambda_c
+        C_ff = coefficient_kernel(
+            theta_f_tilde, theta_f_tilde, self.lambda_c, kernel=self.kernel
         )
         m_f_given_s = (C_fs @ self.alpha_s).reshape(-1)
         C_f_given_s = C_ff - C_fs @ jsp.linalg.cho_solve(
@@ -219,6 +259,7 @@ def profile_log_likelihood(
     F_s: Array,
     *,
     jitter: float = 0.0,
+    kernel: str = "matern32",
 ) -> Array:
     """Library-only log profile likelihood, omitting lambda-independent C.
 
@@ -229,7 +270,7 @@ def profile_log_likelihood(
 
     r, k = F_s.shape
     lambda_c = jnp.exp(log_lambda_c)
-    C_ss = squared_exponential_kernel(theta_s_tilde, theta_s_tilde, lambda_c)
+    C_ss = coefficient_kernel(theta_s_tilde, theta_s_tilde, lambda_c, kernel=kernel)
     L_ss = jnp.linalg.cholesky(C_ss + jitter * jnp.eye(r))
     whitened = jsp.linalg.solve_triangular(L_ss, F_s, lower=True)
     q_s = jnp.sum(jnp.square(whitened), axis=0)
@@ -244,6 +285,7 @@ def _cv_residual_and_variance(
     F_s: Array,
     *,
     jitter: float = 0.0,
+    kernel: str = "matern32",
 ) -> tuple[Array, Array]:
     """Share exact fold predictions between NLPD and WMSE without divergence.
 
@@ -257,8 +299,8 @@ def _cv_residual_and_variance(
     theta_s_tilde = jnp.asarray(theta_s_tilde)
     F_s = jnp.asarray(F_s)
     r, k = F_s.shape
-    C_ss = squared_exponential_kernel(
-        theta_s_tilde, theta_s_tilde, jnp.exp(log_lambda_c)
+    C_ss = coefficient_kernel(
+        theta_s_tilde, theta_s_tilde, jnp.exp(log_lambda_c), kernel=kernel
     )
     rows = jnp.arange(r)
     training = jnp.where(
@@ -288,11 +330,12 @@ def cv_nlpd(
     F_s: Array,
     *,
     jitter: float = 0.0,
+    kernel: str = "matern32",
 ) -> Array:
     """Mean leave-one-run-out NLPD for zero-mean coefficient GP columns."""
 
     residual, predictive_variance = _cv_residual_and_variance(
-        log_lambda_c, theta_s_tilde, F_s, jitter=jitter
+        log_lambda_c, theta_s_tilde, F_s, jitter=jitter, kernel=kernel
     )
     k = F_s.shape[1]
     nlpd = 0.5 * (
@@ -309,6 +352,7 @@ def cv_wmse(
     F_s: Array,
     *,
     jitter: float = 0.0,
+    kernel: str = "matern32",
 ) -> Array:
     """Mean foldwise sum of squared errors divided by predictive variances.
 
@@ -318,7 +362,7 @@ def cv_wmse(
     """
 
     residual, predictive_variance = _cv_residual_and_variance(
-        log_lambda_c, theta_s_tilde, F_s, jitter=jitter
+        log_lambda_c, theta_s_tilde, F_s, jitter=jitter, kernel=kernel
     )
     return jnp.mean(jnp.sum(jnp.square(residual) / predictive_variance, axis=1))
 
@@ -358,6 +402,7 @@ class LengthScaleFit:
     jitter: float
     scipy_version: str
     method: str = "profile"
+    kernel: str = "matern32"
 
 
 def fit_library_length_scales(
@@ -371,6 +416,7 @@ def fit_library_length_scales(
     log_bounds: Array | None = None,
     jitter: float = 0.0,
     method: str = "profile",
+    kernel: str = "matern32",
 ) -> LengthScaleFit:
     """Select length scales by profile likelihood, CV–NLPD, or CV–WMSE.
 
@@ -383,6 +429,8 @@ def fit_library_length_scales(
     """
 
     theta_np, F_np = _validate_library_inputs(theta_s_tilde, F_s, jitter)
+    if kernel not in COEFFICIENT_KERNELS:
+        raise ValueError("kernel must be se, matern32, or matern52")
     if method not in ("profile", "cv_nlpd", "cv_wmse"):
         raise ValueError("method must be 'profile', 'cv_nlpd', or 'cv_wmse'")
     if np.any(np.all(F_np == 0.0, axis=0)):
@@ -417,7 +465,7 @@ def fit_library_length_scales(
     }[method]
     sign = -1.0 if method == "profile" else 1.0
     evaluate = jax.jit(jax.value_and_grad(
-        lambda xi: objective(xi, theta, F, jitter=jitter)
+        lambda xi: objective(xi, theta, F, jitter=jitter, kernel=kernel)
     ))
 
     # SciPy needs host scalars/arrays; JAX retains the differentiable kernel.
@@ -426,7 +474,7 @@ def fit_library_length_scales(
             lambda_candidate = np.exp(xi)
         if not np.all(np.isfinite(lambda_candidate)) or np.any(lambda_candidate <= 0):
             raise ValueError("Candidate lambda_c is not finite and positive")
-        _library_factor(theta_np, lambda_candidate, jitter)
+        _library_factor(theta_np, lambda_candidate, jitter, kernel)
         value, gradient = evaluate(jnp.asarray(xi))
         value_np = float(value)
         gradient_np = np.asarray(gradient)
@@ -469,9 +517,9 @@ def fit_library_length_scales(
     )
     log_lambda_c = jnp.asarray(best.optimum)
     lambda_c = jnp.exp(log_lambda_c)
-    library = LibraryGP.from_data(theta, F, lambda_c, jitter=jitter)
+    library = LibraryGP.from_data(theta, F, lambda_c, jitter=jitter, kernel=kernel)
     return LengthScaleFit(
         lambda_c, log_lambda_c, library.q_s / theta.shape[0],
         best.objective, tuple(attempts), bounds,
-        float(gtol), float(ftol), maxiter, float(jitter), scipy_version, method,
+        float(gtol), float(ftol), maxiter, float(jitter), scipy_version, method, kernel,
     )

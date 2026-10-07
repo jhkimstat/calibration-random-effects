@@ -173,7 +173,7 @@ class CalibrationTarget:
             raise ValueError("m_delta_0 must be finite with shape (k,)")
         if V_delta_0_np.shape != (k, k) or not np.all(np.isfinite(V_delta_0_np)):
             raise ValueError("V_delta_0 must be finite with shape (k,k)")
-        if not np.array_equal(V_delta_0_np, V_delta_0_np.T):
+        if not np.allclose(V_delta_0_np, V_delta_0_np.T, rtol=1e-12, atol=1e-14):
             raise ValueError("V_delta_0 must be symmetric")
         try:
             np.linalg.cholesky(V_delta_0_np)

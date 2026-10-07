@@ -164,7 +164,6 @@ def discrepancy_conditional_moments(
         jsp.linalg.cho_solve((L_delta_0, True), I_k)
         + H_whitened.T @ H_whitened
     )
-    Lambda_delta = 0.5 * (Lambda_delta + Lambda_delta.T)
     h_delta = (
         jsp.linalg.cho_solve((L_delta_0, True), m_delta_0)
         + H_whitened.T @ residual_whitened
@@ -172,7 +171,6 @@ def discrepancy_conditional_moments(
     L_delta = jnp.linalg.cholesky(Lambda_delta)
     m_delta = jsp.linalg.cho_solve((L_delta, True), h_delta)
     V_delta = jsp.linalg.cho_solve((L_delta, True), I_k)
-    V_delta = 0.5 * (V_delta + V_delta.T)
     return m_delta, V_delta
 
 
@@ -389,7 +387,6 @@ def spatial_mean_conditional_moments(
         jsp.linalg.cho_solve((L_theta_0, True), I_d)
         + a * jsp.linalg.cho_solve((L_theta, True), I_d)
     )
-    Lambda_theta = 0.5 * (Lambda_theta + Lambda_theta.T)
     h_theta = (
         jsp.linalg.cho_solve((L_theta_0, True), m_theta_0)
         + jsp.linalg.cho_solve((L_theta, True), theta_tilde.T @ w)
@@ -397,7 +394,7 @@ def spatial_mean_conditional_moments(
     L_precision = jnp.linalg.cholesky(Lambda_theta)
     m_theta = jsp.linalg.cho_solve((L_precision, True), h_theta)
     V_theta = jsp.linalg.cho_solve((L_precision, True), I_d)
-    return m_theta, 0.5 * (V_theta + V_theta.T)
+    return m_theta, V_theta
 
 
 def sample_spatial_mean(
@@ -436,7 +433,7 @@ def update_spatial_mean(
     Sigma_np = np.asarray(Sigma_theta, dtype=np.float64)
     if Sigma_np.shape != (d, d) or not np.all(np.isfinite(Sigma_np)):
         raise ValueError("Sigma_theta must be finite with shape (d,d)")
-    if not np.array_equal(Sigma_np, Sigma_np.T):
+    if not np.allclose(Sigma_np, Sigma_np.T, rtol=1e-12, atol=1e-14):
         raise ValueError("Sigma_theta must be symmetric")
     try:
         np.linalg.cholesky(Sigma_np)
@@ -472,7 +469,7 @@ def spatial_covariance_conditional_parameters(
     E_whitened = jsp.linalg.solve_triangular(L_C, E_theta, lower=True)
     nu_theta = jnp.asarray(nu_theta_0, dtype=jnp.float64) + theta_tilde.shape[0]
     S_theta = S_theta_0 + E_whitened.T @ E_whitened
-    return nu_theta, 0.5 * (S_theta + S_theta.T)
+    return nu_theta, S_theta
 
 
 def sample_inverse_wishart(key: Array, nu: Array, S: Array) -> Array:
@@ -496,7 +493,7 @@ def sample_inverse_wishart(key: Array, nu: Array, S: Array) -> Array:
     L_S = jnp.linalg.cholesky(S)
     T = jsp.linalg.solve_triangular(A, L_S.T, lower=True)
     Sigma = T.T @ T
-    return 0.5 * (Sigma + Sigma.T)
+    return Sigma
 
 
 def sample_spatial_covariance(

@@ -41,6 +41,8 @@ def parser() -> argparse.ArgumentParser:
     prep = commands.add_parser("prepare", help="Fit and freeze fixed numerical inputs for all methods")
     prep.add_argument("--input", type=Path, required=True, help="Preprocessing NPZ with theta_s_dagger,F_s,y_tilde,R,s")
     prep.add_argument("--scientific-config", type=Path, help="JSON model and library_fit settings; defaults to packaged recipe")
+    prep.add_argument("--kernel", choices=experiment.COEFFICIENT_KERNELS, default=argparse.SUPPRESS,
+                      help="Coefficient GP kernel override; recipe default matern32; spatial GP remains SE")
     prep.add_argument("--output", type=Path, required=True)
     run = commands.add_parser("run", help="Initialize, warm up, sample, and summarize a fresh experiment")
     run.add_argument("--prepared", type=Path, required=True)
@@ -80,6 +82,8 @@ def main(argv: list[str] | None = None) -> None:
     if arguments.command == "prepare":
         scientific = (json.loads(arguments.scientific_config.read_text())
                       if arguments.scientific_config else experiment.default_config("scientific"))
+        if hasattr(arguments, "kernel"):
+            scientific["library_fit"]["kernel"] = arguments.kernel
         experiment.prepare_experiment(arguments.input, scientific, arguments.output)
         print(json.dumps({"prepared": str(arguments.output)}))
         return

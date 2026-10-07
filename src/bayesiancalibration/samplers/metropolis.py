@@ -253,7 +253,7 @@ def _validate_collapsed_inputs(
         if name in ("sigma_y2", "sigma_c2") and np.any(value_np <= 0):
             raise ValueError(f"{name} must be positive")
         if name in ("Sigma_theta", "V_prop"):
-            if not np.array_equal(value_np, np.swapaxes(value_np, -1, -2)):
+            if not np.allclose(value_np, np.swapaxes(value_np, -1, -2), rtol=1e-12, atol=1e-14):
                 raise ValueError(f"{name} must be symmetric")
             try:
                 np.linalg.cholesky(value_np)
