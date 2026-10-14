@@ -20,18 +20,21 @@ import jax.numpy as jnp
 import jax.scipy as jsp
 import numpy as np
 from jax import Array
+from scipy.spatial.distance import cdist
 
 from bayesiancalibration.gp import LibraryGP
 from bayesiancalibration.linalg import projected_collapsed_logpdf
 from bayesiancalibration.state import SpatialPrior
 from bayesiancalibration.transforms import SiteCoordinates
+from bayesiancalibration.validation import validate_spd
 
 
 def inverse_gamma_logpdf(value: Array, shape: Array, scale: Array) -> Array:
     """Elementwise normalized shape/scale inverse-Gamma log density.
 
-    The installed JAX stats module has no inverse-Gamma logpdf. This direct
-    formula remains differentiable and JIT compatible for positive values.
+    The installed JAX stats module has no inverse-Gamma logpdf. SciPy's
+    invgamma cannot evaluate JAX tracers in compiled targets, so this small
+    formula retains JIT/autodiff support for positive values.
     """
 
     return (
@@ -49,8 +52,9 @@ def inverse_wishart_logpdf(
 ) -> Array:
     """Normalized inverse-Wishart log density via Cholesky solves.
 
-    JAX has ``multigammaln`` but no inverse-Wishart distribution. This formula
-    follows the source-note degrees-of-freedom/scale parameterization.
+    JAX has ``multigammaln`` but no inverse-Wishart distribution; SciPy's
+    invwishart cannot evaluate JAX tracers. This JIT/autodiff-compatible
+    formula follows the source-note degrees-of-freedom/scale parameterization.
     ``Sigma_theta`` and ``S_theta_0`` must be positive definite (d, d).
     """
 
@@ -150,9 +154,9 @@ class CalibrationTarget:
             raise ValueError("Projected observations and R must be finite")
 
         # The spatial range is isotropic and fixed, unlike the ARD emulator.
-        distances = s_np[:, None, :] - s_np[None, :, :]
+        squared_distances = cdist(s_np, s_np, metric="sqeuclidean")
         C_theta_np = np.exp(
-            -0.5 * np.sum(np.square(distances), axis=-1) / lambda_theta**2
+            -0.5 * squared_distances / lambda_theta**2
         )
         eigenvalues = np.linalg.eigvalsh(C_theta_np)
         if (
@@ -171,14 +175,7 @@ class CalibrationTarget:
         )
         if m_delta_0_np.shape != (k,) or not np.all(np.isfinite(m_delta_0_np)):
             raise ValueError("m_delta_0 must be finite with shape (k,)")
-        if V_delta_0_np.shape != (k, k) or not np.all(np.isfinite(V_delta_0_np)):
-            raise ValueError("V_delta_0 must be finite with shape (k,k)")
-        if not np.allclose(V_delta_0_np, V_delta_0_np.T, rtol=1e-12, atol=1e-14):
-            raise ValueError("V_delta_0 must be symmetric")
-        try:
-            np.linalg.cholesky(V_delta_0_np)
-        except np.linalg.LinAlgError as error:
-            raise ValueError("V_delta_0 must be positive definite") from error
+        V_delta_0 = validate_spd(V_delta_0_np, (k, k), "V_delta_0")
 
         B = len(branch_sizes)
         alpha_y_0_np = (
@@ -219,7 +216,7 @@ class CalibrationTarget:
             gp, coordinates, spatial_prior,
             jnp.asarray(y_np), jnp.asarray(R_np), jnp.asarray(C_theta_np),
             tuple(branch_sizes), float(lambda_theta),
-            jnp.asarray(m_delta_0_np), jnp.asarray(V_delta_0_np),
+            jnp.asarray(m_delta_0_np), V_delta_0,
             jnp.asarray(alpha_y_0_np), jnp.asarray(beta_y_0_np),
             jnp.asarray(alpha_c_0_np), jnp.asarray(beta_c_0_np),
         )

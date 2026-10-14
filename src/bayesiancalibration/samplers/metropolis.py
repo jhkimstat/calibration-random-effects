@@ -15,7 +15,7 @@ import jax.numpy as jnp
 import numpy as np
 from blackjax.mcmc import mala, random_walk
 from jax import Array
-from bayesiancalibration.validation import check_quantity
+from bayesiancalibration.validation import check_quantity, validate_spd
 
 from bayesiancalibration.targets import CalibrationTarget
 
@@ -247,18 +247,14 @@ def _validate_collapsed_inputs(
     )
     checked = []
     for name, value, shape in shapes:
+        if name in ("Sigma_theta", "V_prop"):
+            checked.append(validate_spd(value, shape, name))
+            continue
         value_np = np.asarray(value, dtype=np.float64)
         if value_np.shape != shape or not np.all(np.isfinite(value_np)):
             raise ValueError(f"{name} must be finite with shape {shape}")
         if name in ("sigma_y2", "sigma_c2") and np.any(value_np <= 0):
             raise ValueError(f"{name} must be positive")
-        if name in ("Sigma_theta", "V_prop"):
-            if not np.allclose(value_np, np.swapaxes(value_np, -1, -2), rtol=1e-12, atol=1e-14):
-                raise ValueError(f"{name} must be symmetric")
-            try:
-                np.linalg.cholesky(value_np)
-            except np.linalg.LinAlgError as error:
-                raise ValueError(f"{name} must be positive definite") from error
         checked.append(jnp.asarray(value_np))
 
     eta_checked, delta_checked, noise, mean, covariance, variances, proposal = checked

@@ -18,6 +18,7 @@ from jax import Array
 
 from bayesiancalibration.linalg import projected_marginal_moments
 from bayesiancalibration.targets import CalibrationTarget
+from bayesiancalibration.validation import validate_spd
 
 
 def sample_projected_coefficients(
@@ -245,7 +246,8 @@ def update_discrepancy(
 def sample_inverse_gamma(key: Array, shape: Array, scale: Array) -> Array:
     """Draw independent shape/scale inverse-Gamma values, matching broadcasts.
 
-    JAX has no inverse-Gamma sampler. Use its standard unit-scale log-Gamma
+    JAX has no inverse-Gamma sampler. SciPy's sampler cannot consume JAX keys
+    inside JIT/vmap; use JAX's standard unit-scale log-Gamma
     sampler and the exact transformation v=scale/Gamma(shape,1). Log space
     avoids prematurely underflowing a small Gamma draw. Valid positive
     float64 inputs are required; no truncation or flooring is applied.
@@ -430,17 +432,9 @@ def update_spatial_mean(
 
     theta_tilde = _current_theta_tilde(target, eta)
     d = theta_tilde.shape[1]
-    Sigma_np = np.asarray(Sigma_theta, dtype=np.float64)
-    if Sigma_np.shape != (d, d) or not np.all(np.isfinite(Sigma_np)):
-        raise ValueError("Sigma_theta must be finite with shape (d,d)")
-    if not np.allclose(Sigma_np, Sigma_np.T, rtol=1e-12, atol=1e-14):
-        raise ValueError("Sigma_theta must be symmetric")
-    try:
-        np.linalg.cholesky(Sigma_np)
-    except np.linalg.LinAlgError as error:
-        raise ValueError("Sigma_theta must be positive definite") from error
+    Sigma_theta = validate_spd(Sigma_theta, (d, d), "Sigma_theta")
     mu_theta = sample_spatial_mean(
-        key, theta_tilde, target.C_theta, jnp.asarray(Sigma_np),
+        key, theta_tilde, target.C_theta, Sigma_theta,
         target.spatial_prior.m_theta_0, target.spatial_prior.V_theta_0,
     )
     if not np.all(np.isfinite(np.asarray(mu_theta))):
@@ -475,8 +469,9 @@ def spatial_covariance_conditional_parameters(
 def sample_inverse_wishart(key: Array, nu: Array, S: Array) -> Array:
     """Draw IW_d(nu,S) (d,d) with valid float64 S SPD and nu > d-1.
 
-    JAX has no inverse-Wishart sampler; this Bartlett construction preserves
-    explicit JAX keys and JIT/vmap support. Normal/chi-square generation and
+    JAX has no inverse-Wishart sampler; SciPy's sampler does not support JIT
+    or JAX keys. This Bartlett construction preserves explicit keys and
+    JIT/vmap support. Normal/chi-square generation and
     triangular solves use standard functions. With A A.T ~ Wishart(nu,I)
     and S=L_S L_S.T, solve T=A^{-1} L_S.T and return T.T T, whose precision
     is Wishart(nu,S^{-1}). This avoids explicit matrix inverses. Real, non-

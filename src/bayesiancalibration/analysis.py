@@ -22,7 +22,7 @@ from bayesiancalibration.state import CalibrationState
 
 
 def _split(values: np.ndarray) -> np.ndarray:
-    """Split chain halves, excluding the middle draw for odd lengths."""
+    """Preserve middle-draw exclusion; BlackJAX's convenience drops the last."""
     half = values.shape[1] // 2
     return np.concatenate((values[:, :half], values[:, -half:]), axis=0)
 
@@ -30,8 +30,10 @@ def _split(values: np.ndarray) -> np.ndarray:
 def _rank_normalize(values: np.ndarray) -> np.ndarray:
     """Pool ranks per quantity with average ties and Blom's normal scores.
 
-    This composition is needed because BlackJAX's basic diagnostics do not
-    rank-normalize. The denominator is S + 1/4, as in posterior's z_scale.
+    BlackJAX 1.6.2's convenience diagnostics use ordinal ranks for ties,
+    while the project's recorded convention requires average ranks. Use
+    SciPy rankdata/ndtri rather than a custom ranking algorithm. The
+    denominator is S + 1/4, as in posterior's z_scale.
     """
     pooled = values.reshape((-1, values.shape[-1]))
     ranks = rankdata(pooled, axis=0, method="average")

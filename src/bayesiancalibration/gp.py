@@ -33,6 +33,8 @@ def squared_exponential_kernel(
 
     Both inputs have trailing dimension d; ``lambda_c`` is positive (d,).
     Input validation belongs to the preparation boundary, outside JIT.
+    Keep this existing explicit-SE API name; the implementation delegates
+    to the single kernel function and duplicates no numerical algorithm.
     """
 
     return coefficient_kernel(theta_a_tilde, theta_b_tilde, lambda_c, kernel="se")
@@ -49,7 +51,8 @@ def coefficient_kernel(
 
     Inputs are standardized (a,d)/(b,d) rows. ``kernel`` is a fixed Python
     string: close over it or mark it static when JIT compiling this function.
-    JAX has no Matérn primitive, so these closed forms use standard operations.
+    JAX has no Matérn primitive, and SciPy/scikit-learn kernels do not support
+    JAX tracing/autodiff; these closed forms use standard JAX operations.
     At exactly zero squared distance, the value and derivatives use the
     analytic polynomial extension. This avoids sqrt(0) autodiff NaNs without
     adding a distance floor/nugget or approximating any nonzero distance.

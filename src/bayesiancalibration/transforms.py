@@ -94,7 +94,11 @@ class SiteCoordinates:
         return jsp.special.logit(unit)
 
     def log_jacobian(self, eta: Array) -> Array:
-        """Sum log|d theta_tilde / d eta| over all site coordinates."""
+        """Sum log|d theta_tilde / d eta| over all site coordinates.
+
+        The sigmoid derivative is the standard logistic density, so its
+        library logpdf supplies the stable Jacobian term, including tails.
+        """
 
         eta = jnp.asarray(eta, dtype=jnp.float64)
         if (
@@ -106,6 +110,5 @@ class SiteCoordinates:
             return jnp.zeros((), dtype=eta.dtype)
         return jnp.sum(
             jnp.log(self.u_tilde - self.l_tilde)
-            - jnn.softplus(-eta)
-            - jnn.softplus(eta)
+            + jsp.stats.logistic.logpdf(eta)
         )
